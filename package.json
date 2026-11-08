@@ -1,0 +1,32 @@
+{
+  "name": "workbuddy-cli",
+  "version": "1.0.0",
+  "description": "Zero-dependency CLI for Tencent WorkBuddy desktop app via native WBIPC protocol.",
+  "type": "module",
+  "main": "bin/workbuddy.mjs",
+  "bin": {
+    "workbuddy": "bin/workbuddy.mjs",
+    "wb": "bin/workbuddy.mjs"
+  },
+  "keywords": [
+    "workbuddy",
+    "cli",
+    "tencent",
+    "hunyuan",
+    "deepseek",
+    "glm",
+    "kimi",
+    "llm",
+    "agent"
+  ],
+  "author": "backtomyfuture",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "bin",
+    "README.md",
+    "LICENSE"
+  ]
+}
