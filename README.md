@@ -11,12 +11,10 @@
 
 ## ✨ 核心特性 / Features
 
-* 🔑 **免配置 API Key**：直接复用本地已登录的 WorkBuddy 桌面端凭据与免费额度。
-* 📦 **零第三方依赖 (Zero Dependencies)**：100% 采用 Node.js 原生内置模块（`net`, `crypto`），无需 `npm install` 任何重型包，启动极速。
-* ⚡️ **原生 WBIPC 协议通信**：基于本地 Unix Domain Socket 与 HMAC-SHA256 握手直接与客户端进程通信，毫秒级响应，告别无头浏览器或 GUI 模拟点击。
-* 🤖 **内置支持 40+ 顶级大模型**：
-  * **免费/默认**：腾讯混元 4.0 (`hy4` / `hy4free`)、混元 3.0 (`hy3`)、DeepSeek-V3.2
-  * **最新旗舰**：DeepSeek-V4.1 Flash、GLM-5.3、Kimi-K3.1 Pro、MiniMax-M3.1 Flash、小米 MiMo-V2.6 Pro、阶跃星辰 Step-5
+* 🔓 **支持独立登录，告别桌面端常驻**：内置 `workbuddy login` / `logout` / `status`，浏览器扫码授权一次后即可关闭 WorkBuddy 客户端，直接通过 HTTPS 调用并自动刷新 Token。
+* 🔑 **免配置 API Key & 双通道容错**：优先使用 CLI 独立凭据直连服务端；未登录 CLI 时，自动回退复用本地运行中的 WorkBuddy 桌面端 WBIPC 通道。
+* 📦 **零第三方依赖 (Zero Dependencies)**：100% 采用 Node.js 原生内置模块（`fetch`, `net`, `crypto`, `child_process`），无需安装任何重型包，启动极速。
+* 🔎 **实时扫描服务端最新模型**：运行 `workbuddy models`（或 `-l`）动态拉取当前账号所有可用模型、积分倍率与能力标签，新增模型无需更新 CLI 即可直接 `-m <model_id>` 调用。
 * 🔄 **流式管道与脚本友好**：
   * 支持标准 Unix 管道（`cat file | workbuddy`）
   * 支持结构化 JSON 输出（`--json`）
@@ -62,6 +60,12 @@ mkdir -p ~/.local/bin
 ln -sf "$(pwd)/bin/workbuddy.mjs" ~/.local/bin/workbuddy
 ln -sf "$(pwd)/bin/workbuddy.mjs" ~/.local/bin/wb
 ```
+
+### 🔄 更新到最新版本 / Upgrade
+
+* **npm 全局安装用户**：`npm install -g workbuddy-cli@latest`
+* **一键脚本安装用户**：重新运行 `curl -fsSL https://raw.githubusercontent.com/backtomyfuture/workbuddy-cli/main/install.sh | bash`
+* **手动克隆软链用户**：进入仓库目录执行 `git pull`
 
 ---
 
@@ -166,33 +170,36 @@ workbuddy models --all --json
 ## 🛠 工作原理 / How It Works
 
 ```
-┌─────────────────┐         Unix Domain Socket (WBIPC)         ┌────────────────────────┐
-│  workbuddy-cli  │ ─────────────────────────────────────────> │   WorkBuddy Desktop    │
-│  (Pure Node.js) │ <───────────────────────────────────────── │     (Electron App)     │
-└─────────────────┘      HMAC-SHA256 Handshake + JSON-RPC      └───────────┬────────────┘
-                                                                           │
-                                                                 Authorized Proxy Fetch
-                                                                           │
-                                                                           ▼
-                                                               ┌────────────────────────┐
-                                                               │  Tencent Cloud Backend │
-                                                               │ (https://workbuddy.cn) │
-                                                               └────────────────────────┘
+模式 A（推荐）：CLI 独立直连（无需启动桌面端）
+┌─────────────────┐         HTTPS + Bearer Token (+ 自动刷新)        ┌────────────────────────┐
+│  workbuddy-cli  │ ───────────────────────────────────────────────> │  Tencent Cloud Backend │
+│  (Pure Node.js) │ <─────────────────────────────────────────────── │ (www.workbuddy.cn)     │
+└─────────────────┘   ~/.workbuddy-cli/auth.json (0600 权限隔离)      └────────────────────────┘
+
+模式 B（回退）：未登录 CLI 时自动复用桌面端 WBIPC
+┌─────────────────┐      Unix Domain Socket (WBIPC)      ┌────────────────────────┐
+│  workbuddy-cli  │ ───────────────────────────────────> │   WorkBuddy Desktop    │
+└─────────────────┘   HMAC-SHA256 Handshake + JSON-RPC   └────────────────────────┘
 ```
 
-1. **自动发现**：CLI 自动读取 `~/.workbuddy/wbipc/endpoint.json`，获取当前运行中 WorkBuddy 实例的 Unix 套接字与握手 Ticket。
-2. **安全握手**：客户端发起 `session_hello`，服务端下发随机 Nonce 挑战，CLI 计算 HMAC-SHA256 签名通过验证。
-3. **管线代理**：CLI 绑定 `wb.request` 管线，利用内部 `http.fetch` 发起对话请求，直接继承桌面端已登录会话的鉴权与配额。
+1. **独立登录与自动刷新（模式 A）**：`workbuddy login` 通过外部链接授权轮询获取 Token 与账号信息，以 `0600` 权限保存在 `~/.workbuddy-cli/auth.json`（与桌面端配置完全隔离）。后续请求直接走 HTTPS `/v2/chat/completions` 与 `/v2/enterprises/.../models`，Token 临期或遇 `401` 时自动刷新；`workbuddy logout` 会注销服务端会话并清理本地凭据。
+2. **WBIPC 桌面端回退（模式 B）**：若未执行 `workbuddy login`，CLI 会自动检测 `~/.workbuddy/wbipc/endpoint.json`，通过 HMAC-SHA256 握手与桌面端的 `wb.request` 管线代理请求。
 
 ---
 
 ## ❓ 常见问题 / FAQ
 
-**Q: 运行提示 `WorkBuddy 桌面端未运行，未找到 WBIPC 端点`？**  
-A: 请确保你的电脑上已经打开了 WorkBuddy 客户端（`open -a WorkBuddy`）并且处于登录状态。
+**Q: 能够脱离 WorkBuddy 桌面端独立运行吗？**  
+A: 可以！运行一次 `workbuddy login` 在浏览器完成授权后，即可彻底关闭 WorkBuddy 桌面端，CLI 会直接与服务端通信并自动续期 Token。
 
-**Q: 能够脱离桌面端独立运行吗？**  
-A: WorkBuddy 的用户鉴权 Token 在本地采用操作系统级安全加密，保护机主权益。本 CLI 的设计理念即是“零配置”借用本地桌面端作为安全通道，因此无需用户在代码或配置文件中粘贴敏感凭据。
+**Q: 运行提示 `未登录且 WorkBuddy 桌面端未运行`？**  
+A: 请先运行 `workbuddy login` 登录（推荐，无需开客户端），或者启动 WorkBuddy 桌面端（`open -a WorkBuddy`）。
+
+**Q: 服务端新增了模型，CLI 需要升级才能用吗？**  
+A: 不需要。运行 `workbuddy models` 可实时从服务端扫描所有最新可用模型，然后直接通过 `workbuddy -m <model_id> "..."` 调用即可。
+
+**Q: 远程 SSH / 无图形界面环境如何登录？**  
+A: 运行 `workbuddy login --no-browser`，终端会打印授权链接，在本地浏览器打开完成授权即可。
 
 ---
 
