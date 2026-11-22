@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -6,6 +7,15 @@ import os from 'node:os';
 import path from 'node:path';
 
 const PROTOCOL_VERSION = 1;
+const DEFAULT_ENDPOINT = 'https://www.workbuddy.cn';
+const AUTH_PREFIX = '/v2/plugin';
+const AUTH_PLATFORM = 'workbuddy';
+const AUTH_DIR = path.join(os.homedir(), '.workbuddy-cli');
+const AUTH_FILE = path.join(AUTH_DIR, 'auth.json');
+const LOGIN_POLL_INTERVAL_MS = 1500;
+const LOGIN_TIMEOUT_MS = 300000;
+const LOGIN_TOKEN_PENDING_CODE = 11217;
+const LOGIN_ACCOUNT_PENDING_CODE = 12151;
 
 const MODEL_ALIASES = {
   // 模式
@@ -138,9 +148,15 @@ function showModels() {
 }
 
 function showHelp() {
-  console.log(`Usage: workbuddy [options] [prompt]
+  console.log(`Usage: workbuddy [command] [options] [prompt]
 
-Interact with your local WorkBuddy desktop app via WBIPC.
+Interact with WorkBuddy directly (after login) or via local desktop WBIPC.
+
+Commands:
+  login                   Log in via browser (no desktop app needed afterwards)
+  logout                  Revoke session and remove local CLI credentials
+  status, whoami          Show current CLI auth and desktop WBIPC status
+  models                  Scan available models from server (falls back to static list)
 
 Arguments:
   prompt                  Your prompt / question
@@ -148,24 +164,49 @@ Arguments:
 Options:
   -p, --print             Print response and exit (default behavior)
   -m, --model <model>     Model name or alias (e.g. hy4, deepseek, glm, default: deepseek-v3-2-volc)
-  -l, --models            List available models and aliases
+  -l, --models            Scan/list available models and aliases
+  --all                   Include specialized/image models when listing models
+  --static                Show built-in static model list without querying server
   --json                  Output response as JSON
   -s, --system <prompt>   System prompt
+  --no-browser            Print login URL instead of opening browser automatically
   -h, --help              Show this help message
 
 Examples:
+  workbuddy login
+  workbuddy models
   workbuddy "用Python写一个快速排序"
   workbuddy -m hy4 "帮我写一封商务邮件"
   cat document.txt | workbuddy -p "总结主要内容"
   workbuddy --model glm "写一首五言绝句"
+  workbuddy logout
 `);
 }
 
 function parseArgs(args) {
+  let command = 'chat';
   let prompt = '';
   let model = 'deepseek-v3-2-volc';
   let asJson = false;
   let systemPrompt = '';
+  let noBrowser = false;
+  let includeAllModels = false;
+  let staticModels = false;
+
+  const first = args[0];
+  if (first === 'login' || first === '--login') {
+    command = 'login';
+    args = args.slice(1);
+  } else if (first === 'logout' || first === '--logout') {
+    command = 'logout';
+    args = args.slice(1);
+  } else if (first === 'status' || first === 'whoami' || first === '--status') {
+    command = 'status';
+    args = args.slice(1);
+  } else if (first === 'models') {
+    command = 'models';
+    args = args.slice(1);
+  }
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -173,12 +214,17 @@ function parseArgs(args) {
       showHelp();
       process.exit(0);
     } else if (arg === '-l' || arg === '--models') {
-      showModels();
-      process.exit(0);
+      command = 'models';
     } else if (arg === '-p' || arg === '--print') {
       // default
     } else if (arg === '--json') {
       asJson = true;
+    } else if (arg === '--no-browser') {
+      noBrowser = true;
+    } else if (arg === '--all') {
+      includeAllModels = true;
+    } else if (arg === '--static') {
+      staticModels = true;
     } else if (arg === '-m' || arg === '--model') {
       model = args[++i];
     } else if (arg.startsWith('--model=')) {
@@ -197,7 +243,7 @@ function parseArgs(args) {
     model = MODEL_ALIASES[model.toLowerCase()];
   }
 
-  return { prompt, model, asJson, systemPrompt };
+  return { command, prompt, model, asJson, systemPrompt, noBrowser, includeAllModels, staticModels };
 }
 
 function encodeTranscript(role, t) {
@@ -223,10 +269,607 @@ function ticketIdOf(ticket) {
   return crypto.createHash('sha256').update(ticket, 'utf8').digest('hex').slice(0, 16);
 }
 
-async function callWorkBuddy(userPrompt, options = {}) {
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function readCliSession() {
+  if (!fs.existsSync(AUTH_FILE)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function writeCliSession(session) {
+  fs.mkdirSync(AUTH_DIR, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(AUTH_FILE, JSON.stringify(session, null, 2) + '\n', { mode: 0o600 });
+}
+
+function removeCliSession() {
+  if (fs.existsSync(AUTH_FILE)) {
+    fs.unlinkSync(AUTH_FILE);
+  }
+}
+
+function normalizeToken(raw, fallbackDomain = 'www.workbuddy.cn') {
+  const now = Date.now();
+  const expiresAt = raw.expiresAt || (raw.expiresIn ? now + raw.expiresIn * 1000 : undefined);
+  const refreshExpiresAt = raw.refreshExpiresAt || (raw.refreshExpiresIn ? now + raw.refreshExpiresIn * 1000 : undefined);
+  return {
+    accessToken: raw.accessToken,
+    refreshToken: raw.refreshToken,
+    tokenType: raw.tokenType,
+    domain: raw.domain || fallbackDomain,
+    expiresAt,
+    refreshExpiresAt,
+    lastRefreshTime: now
+  };
+}
+
+function buildDomainHeader(endpoint, auth) {
+  try {
+    return auth?.domain || new URL(endpoint).host;
+  } catch {
+    return 'www.workbuddy.cn';
+  }
+}
+
+function buildEnterpriseHeaders(endpoint, auth, account) {
+  const headers = {
+    'X-Domain': buildDomainHeader(endpoint, auth)
+  };
+  const enterpriseId = account?.enterpriseId;
+  if (enterpriseId) {
+    headers['X-Enterprise-Id'] = enterpriseId;
+    headers['X-Tenant-Id'] = enterpriseId;
+  }
+  return headers;
+}
+
+function openExternalUrl(url) {
+  return new Promise(resolve => {
+    const platform = process.platform;
+    let cmd;
+    let args;
+    if (platform === 'darwin') {
+      cmd = 'open';
+      args = [url];
+    } else if (platform === 'win32') {
+      cmd = 'cmd';
+      args = ['/c', 'start', '', url];
+    } else {
+      cmd = 'xdg-open';
+      args = [url];
+    }
+    try {
+      const child = spawn(cmd, args, { stdio: 'ignore', detached: true });
+      child.on('error', () => resolve(false));
+      child.unref();
+      resolve(true);
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+async function fetchJson(url, options = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 15000);
+  try {
+    const res = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+    const text = await res.text();
+    let json = null;
+    try {
+      json = JSON.parse(text);
+    } catch {}
+    return { status: res.status, ok: res.ok, json, text };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function loginWorkBuddy(options = {}) {
+  const endpoint = DEFAULT_ENDPOINT;
+  const noAuthHeaders = {
+    'Content-Type': 'application/json',
+    'X-Domain': buildDomainHeader(endpoint),
+    'X-No-Authorization': 'true',
+    'X-No-User-Id': 'true',
+    'X-No-Enterprise-Id': 'true',
+    'X-No-Department-Info': 'true'
+  };
+
+  const stateRes = await fetchJson(`${endpoint}${AUTH_PREFIX}/auth/state?platform=${AUTH_PLATFORM}`, {
+    method: 'POST',
+    headers: noAuthHeaders,
+    body: '{}'
+  });
+
+  if (!stateRes.ok || !stateRes.json?.data?.state || !stateRes.json?.data?.authUrl) {
+    throw new Error(`获取登录链接失败 (HTTP ${stateRes.status}): ${stateRes.json?.msg || stateRes.text}`);
+  }
+
+  const { state, authUrl } = stateRes.json.data;
+  console.error(`请在浏览器中完成 WorkBuddy 登录:\n${authUrl}\n`);
+  if (!options.noBrowser) {
+    const opened = await openExternalUrl(authUrl);
+    if (!opened) {
+      console.error('未能自动打开浏览器，请手动复制上方链接到浏览器打开。');
+    }
+  }
+  console.error('等待登录完成...');
+
+  const deadline = Date.now() + LOGIN_TIMEOUT_MS;
+  let tokenData = null;
+
+  while (Date.now() < deadline) {
+    await sleep(LOGIN_POLL_INTERVAL_MS);
+    const tokenRes = await fetchJson(
+      `${endpoint}${AUTH_PREFIX}/auth/token?state=${encodeURIComponent(state)}`,
+      { headers: noAuthHeaders }
+    );
+    const body = tokenRes.json;
+    if (body?.data?.accessToken) {
+      tokenData = normalizeToken(body.data, buildDomainHeader(endpoint));
+      break;
+    }
+    if (body?.code === LOGIN_TOKEN_PENDING_CODE) {
+      continue;
+    }
+    throw new Error(`登录轮询失败 (HTTP ${tokenRes.status}): ${body?.msg || tokenRes.text}`);
+  }
+
+  if (!tokenData) {
+    throw new Error('登录超时（5 分钟内未完成登录）');
+  }
+
+  let account = null;
+  const authHeaders = {
+    ...buildEnterpriseHeaders(endpoint, tokenData),
+    'Authorization': `Bearer ${tokenData.accessToken}`,
+    'X-No-User-Id': 'true',
+    'X-No-Enterprise-Id': 'true',
+    'X-No-Department-Info': 'true'
+  };
+
+  const accountDeadline = Math.min(deadline, Date.now() + 30000);
+  while (Date.now() < accountDeadline) {
+    const accRes = await fetchJson(
+      `${endpoint}${AUTH_PREFIX}/login/account?state=${encodeURIComponent(state)}`,
+      { headers: authHeaders }
+    );
+    if (accRes.json?.data) {
+      account = accRes.json.data;
+      break;
+    }
+    if (accRes.json?.code === LOGIN_ACCOUNT_PENDING_CODE) {
+      await sleep(1000);
+      continue;
+    }
+    break;
+  }
+
+  if (!account) {
+    const listRes = await fetchJson(`${endpoint}${AUTH_PREFIX}/accounts`, {
+      headers: {
+        ...buildEnterpriseHeaders(endpoint, tokenData),
+        'Authorization': `Bearer ${tokenData.accessToken}`
+      }
+    });
+    const accounts = listRes.json?.data?.accounts;
+    if (Array.isArray(accounts) && accounts.length > 0) {
+      account = accounts.find(a => a.lastLogin) || accounts[0];
+    }
+  }
+
+  const session = {
+    endpoint,
+    auth: tokenData,
+    account: account ? {
+      uid: account.uid,
+      nickname: account.nickname || account.name || account.username,
+      enterpriseId: account.enterpriseId,
+      type: account.type
+    } : null,
+    updatedAt: Date.now()
+  };
+
+  writeCliSession(session);
+  return session;
+}
+
+async function refreshCliSession(session) {
+  const endpoint = session.endpoint || DEFAULT_ENDPOINT;
+  const refreshToken = session.auth?.refreshToken;
+  if (!refreshToken) {
+    throw new Error('当前凭据缺少 refreshToken，请重新运行 "workbuddy login"');
+  }
+
+  const res = await fetchJson(`${endpoint}${AUTH_PREFIX}/auth/token/refresh`, {
+    method: 'POST',
+    headers: {
+      ...buildEnterpriseHeaders(endpoint, session.auth, session.account),
+      'X-Refresh-Token': refreshToken,
+      'X-Auth-Refresh-Source': 'plugin'
+    },
+    body: '{}'
+  });
+
+  if (!res.ok || !res.json?.data?.accessToken) {
+    throw new Error(`刷新登录态失败 (HTTP ${res.status}): ${res.json?.msg || res.text}，请重新运行 "workbuddy login"`);
+  }
+
+  const updated = {
+    ...session,
+    auth: normalizeToken(res.json.data, session.auth?.domain || buildDomainHeader(endpoint)),
+    updatedAt: Date.now()
+  };
+  writeCliSession(updated);
+  return updated;
+}
+
+async function logoutWorkBuddy() {
+  const session = readCliSession();
+  if (!session) {
+    return { hadSession: false, serverRevoked: false };
+  }
+
+  let serverRevoked = false;
+  const endpoint = session.endpoint || DEFAULT_ENDPOINT;
+  const refreshToken = session.auth?.refreshToken;
+
+  if (refreshToken) {
+    try {
+      const res = await fetchJson(`${endpoint}${AUTH_PREFIX}/auth/logout`, {
+        method: 'POST',
+        headers: {
+          ...buildEnterpriseHeaders(endpoint, session.auth, session.account),
+          'X-Refresh-Token': refreshToken,
+          'X-Auth-Refresh-Source': 'plugin',
+          'X-No-Authorization': 'true'
+        },
+        body: '{}'
+      });
+      serverRevoked = res.ok;
+    } catch {
+      serverRevoked = false;
+    }
+  }
+
+  removeCliSession();
+  return { hadSession: true, serverRevoked };
+}
+
+function parseSseCompletion(raw) {
+  let fullText = '';
+  let reasoning = '';
+
+  for (const line of raw.split('\n')) {
+    if (line.startsWith('data: ')) {
+      const dataStr = line.slice(6).trim();
+      if (dataStr === '[DONE]') continue;
+      try {
+        const parsed = JSON.parse(dataStr);
+        const delta = parsed.choices?.[0]?.delta;
+        if (delta?.content) fullText += delta.content;
+        if (delta?.reasoning_content) reasoning += delta.reasoning_content;
+      } catch {}
+    }
+  }
+
+  return { text: fullText, reasoning };
+}
+
+async function fetchDirectApi(session, method, apiPath, body) {
+  let activeSession = session;
+  if (
+    activeSession.auth?.refreshToken &&
+    activeSession.auth?.expiresAt &&
+    Date.now() >= activeSession.auth.expiresAt - 60000
+  ) {
+    activeSession = await refreshCliSession(activeSession);
+  }
+
+  const sendOnce = async s => {
+    const endpoint = (s.endpoint || DEFAULT_ENDPOINT).replace(/\/+$/, '');
+    const headers = {
+      'Accept': 'application/json',
+      'Authorization': `Bearer ${s.auth.accessToken}`
+    };
+    if (s.account?.uid) {
+      headers['X-User-Id'] = s.account.uid;
+    }
+    if (s.account?.enterpriseId) {
+      headers['X-Enterprise-Id'] = s.account.enterpriseId;
+      headers['X-Tenant-Id'] = s.account.enterpriseId;
+    }
+    const init = { method, headers };
+    if (body !== undefined && method !== 'GET' && method !== 'HEAD') {
+      headers['Content-Type'] = 'application/json';
+      init.body = JSON.stringify(body);
+    }
+    return fetchJson(`${endpoint}${apiPath}`, init);
+  };
+
+  let res = await sendOnce(activeSession);
+  if (res.status === 401 && activeSession.auth?.refreshToken) {
+    activeSession = await refreshCliSession(activeSession);
+    res = await sendOnce(activeSession);
+  }
+
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}: ${res.json?.msg || res.json?.message || res.text}`);
+  }
+
+  return res.json?.data ?? res.json;
+}
+
+async function fetchIpcApi(method, apiPath, body) {
   const discoveryFile = path.join(os.homedir(), '.workbuddy', 'wbipc', 'endpoint.json');
   if (!fs.existsSync(discoveryFile)) {
-    throw new Error('WorkBuddy 桌面端未运行，未找到 WBIPC 端点。请先启动 WorkBuddy (open -a WorkBuddy)。');
+    throw new Error('WorkBuddy 桌面端未运行');
+  }
+  const discovery = JSON.parse(fs.readFileSync(discoveryFile, 'utf8'));
+
+  return new Promise((resolve, reject) => {
+    const socket = net.connect({ path: discovery.endpoint });
+    let buffer = Buffer.alloc(0);
+    const clientNonce = crypto.randomBytes(16).toString('base64url');
+    const send = frame => socket.write(JSON.stringify(frame) + '\n');
+
+    const timeoutTimer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error('WBIPC 请求超时 (15s)'));
+    }, 15000);
+
+    socket.on('connect', () => {
+      send({
+        type: 'session_hello',
+        protocol_min: PROTOCOL_VERSION,
+        protocol_max: PROTOCOL_VERSION,
+        client_nonce: clientNonce,
+        ticket_id: ticketIdOf(discovery.ticket),
+        client: { kind: 'cli', id: 'workbuddy-cli' }
+      });
+    });
+
+    socket.on('data', chunk => {
+      buffer = Buffer.concat([buffer, chunk]);
+      for (;;) {
+        const nl = buffer.indexOf(0x0a);
+        if (nl < 0) break;
+        const line = buffer.subarray(0, nl);
+        buffer = buffer.subarray(nl + 1);
+        if (line.length === 0) continue;
+
+        let f;
+        try {
+          f = JSON.parse(line.toString('utf8'));
+        } catch {
+          continue;
+        }
+
+        if (f.type === 'session_challenge') {
+          send({
+            type: 'session_prove',
+            client_proof: computeProof(discovery.ticket, 'client', {
+              protocol: PROTOCOL_VERSION,
+              endpoint: discovery.endpoint,
+              clientNonce,
+              serverNonce: f.server_nonce
+            })
+          });
+        } else if (f.type === 'session_hello_ack') {
+          send({ jsonrpc: '2.0', id: 1, method: 'broker/GetPipe', params: { pipe: 'wb.request' } });
+        } else if (f.id === 1) {
+          if (f.error) {
+            clearTimeout(timeoutTimer);
+            socket.end();
+            return reject(new Error(`GetPipe 错误: ${f.error.message}`));
+          }
+          const channel = f.result?.channel;
+          const params = {
+            method,
+            path: apiPath,
+            headers: { 'accept': 'application/json' }
+          };
+          if (body !== undefined && method !== 'GET' && method !== 'HEAD') {
+            params.headers['content-type'] = 'application/json';
+            params.body_b64 = Buffer.from(JSON.stringify(body)).toString('base64');
+          }
+          send({ jsonrpc: '2.0', id: 2, method: `${channel}/http.fetch`, mode: 'call', params });
+        } else if (f.id === 2) {
+          clearTimeout(timeoutTimer);
+          socket.end();
+          if (f.error) return reject(new Error(f.error.message));
+          const raw = f.result?.body_b64 ? Buffer.from(f.result.body_b64, 'base64').toString('utf8') : '';
+          let parsed = null;
+          try { parsed = JSON.parse(raw); } catch {}
+          if (f.result?.status && f.result.status >= 400) {
+            return reject(new Error(`HTTP ${f.result.status}: ${parsed?.msg || parsed?.message || raw}`));
+          }
+          resolve(parsed?.data ?? parsed);
+        }
+      }
+    });
+
+    socket.on('error', err => {
+      clearTimeout(timeoutTimer);
+      reject(new Error(`连接 WorkBuddy 套接字失败: ${err.message}`));
+    });
+  });
+}
+
+async function scanAvailableModels(options = {}) {
+  const cliSession = readCliSession();
+  const discoveryFile = path.join(os.homedir(), '.workbuddy', 'wbipc', 'endpoint.json');
+  const hasIpc = fs.existsSync(discoveryFile);
+
+  if (!cliSession?.auth?.accessToken && !hasIpc) {
+    return { source: 'static', models: null, reason: '未登录且桌面端未运行' };
+  }
+
+  const enterpriseId = cliSession?.account?.enterpriseId;
+  const candidatePaths = enterpriseId
+    ? [`/v2/enterprises/${encodeURIComponent(enterpriseId)}/models`, '/v2/enterprises/personal/models']
+    : ['/v2/enterprises/personal/models'];
+
+  let payload = null;
+  let lastErr = null;
+  for (const apiPath of candidatePaths) {
+    try {
+      payload = cliSession?.auth?.accessToken
+        ? await fetchDirectApi(cliSession, 'GET', apiPath)
+        : await fetchIpcApi('GET', apiPath);
+      if (payload) break;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+
+  if (!payload) {
+    throw lastErr || new Error('获取模型列表失败');
+  }
+
+  const rawList = Array.isArray(payload.models) ? payload.models : Array.isArray(payload) ? payload : [];
+  const excludedTags = new Set(['text-to-image']);
+  const models = options.includeAll
+    ? rawList
+    : rawList.filter(m => {
+        if (!m || typeof m.id !== 'string' || !m.id) return false;
+        const tags = Array.isArray(m.tags) ? m.tags.map(String) : [];
+        return !tags.some(t => excludedTags.has(t));
+      });
+
+  return { source: cliSession?.auth?.accessToken ? 'remote-direct' : 'remote-ipc', models };
+}
+
+function buildReverseAliasMap() {
+  const map = new Map();
+  for (const [alias, target] of Object.entries(MODEL_ALIASES)) {
+    if (alias === target) continue;
+    if (!map.has(target)) map.set(target, []);
+    map.get(target).push(alias);
+  }
+  return map;
+}
+
+function printScannedModels(models, source) {
+  const aliasMap = buildReverseAliasMap();
+  console.log(`WorkBuddy 可用模型列表 (来源: ${source}, 共 ${models.length} 个):\n`);
+  for (const m of models) {
+    const aliases = aliasMap.get(m.id);
+    const aliasText = aliases?.length ? ` (简写: ${aliases.join(', ')})` : '';
+    const credits = m.credits ? ` [${m.credits}]` : '';
+    const caps = [];
+    if (m.supportsReasoning) caps.push('推理');
+    if (m.supportsImages) caps.push('视觉');
+    if (m.supportsToolCall) caps.push('工具');
+    if (Array.isArray(m.tags) && m.tags.length) caps.push(m.tags.join(','));
+    const capText = caps.length ? ` (${caps.join(' / ')})` : '';
+    const title = m.name && m.name !== m.id ? ` — ${m.name}` : '';
+    console.log(`  ${m.id}${aliasText}${title}${credits}${capText}`);
+    const desc = m.descriptionZh || m.descriptionEn;
+    if (desc) {
+      console.log(`      ${desc}`);
+    }
+  }
+  console.log(`\n提示: 使用 workbuddy -m <model_id> "..." 即可直接调用任意新模型，无需等待 CLI 更新。`);
+}
+
+async function callWorkBuddyDirect(session, userPrompt, options = {}) {
+  let activeSession = session;
+  if (
+    activeSession.auth?.refreshToken &&
+    activeSession.auth?.expiresAt &&
+    Date.now() >= activeSession.auth.expiresAt - 60000
+  ) {
+    activeSession = await refreshCliSession(activeSession);
+  }
+
+  const { model = 'deepseek-v3-2-volc', systemPrompt } = options;
+  const messages = [];
+  if (systemPrompt) {
+    messages.push({ role: 'system', content: systemPrompt });
+  }
+  messages.push({ role: 'user', content: userPrompt });
+
+  const payload = {
+    model,
+    messages,
+    stream: true
+  };
+
+  const sendRequest = async s => {
+    const endpoint = (s.endpoint || DEFAULT_ENDPOINT).replace(/\/+$/, '');
+    const headers = {
+      'Content-Type': 'application/json',
+      'Accept': 'text/event-stream',
+      'Authorization': `Bearer ${s.auth.accessToken}`
+    };
+    if (s.account?.uid) {
+      headers['X-User-Id'] = s.account.uid;
+    }
+    if (s.account?.enterpriseId) {
+      headers['X-Enterprise-Id'] = s.account.enterpriseId;
+      headers['X-Tenant-Id'] = s.account.enterpriseId;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 60000);
+    try {
+      const res = await fetch(`${endpoint}/v2/chat/completions`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+      const raw = await res.text();
+      return { status: res.status, raw };
+    } catch (err) {
+      if (err?.name === 'AbortError') {
+        throw new Error('请求超时 (60s)');
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  let res = await sendRequest(activeSession);
+  if (res.status === 401 && activeSession.auth?.refreshToken) {
+    activeSession = await refreshCliSession(activeSession);
+    res = await sendRequest(activeSession);
+  }
+
+  if (res.status >= 400) {
+    let errorText = `HTTP ${res.status}`;
+    try {
+      const errJson = JSON.parse(res.raw);
+      errorText += `: ${errJson.msg || errJson.message || res.raw}`;
+    } catch {
+      if (res.raw) errorText += `: ${res.raw}`;
+    }
+    throw new Error(errorText);
+  }
+
+  return parseSseCompletion(res.raw);
+}
+
+async function callWorkBuddy(userPrompt, options = {}) {
+  const cliSession = readCliSession();
+  if (cliSession?.auth?.accessToken) {
+    return callWorkBuddyDirect(cliSession, userPrompt, options);
+  }
+
+  const discoveryFile = path.join(os.homedir(), '.workbuddy', 'wbipc', 'endpoint.json');
+  if (!fs.existsSync(discoveryFile)) {
+    throw new Error('未登录且 WorkBuddy 桌面端未运行。请先运行 "workbuddy login" 登录，或启动 WorkBuddy 桌面端。');
   }
 
   let discovery;
@@ -348,23 +991,7 @@ async function callWorkBuddy(userPrompt, options = {}) {
           }
 
           const raw = Buffer.from(f.result.body_b64, 'base64').toString('utf8');
-          let fullText = '';
-          let reasoning = '';
-
-          for (const line of raw.split('\n')) {
-            if (line.startsWith('data: ')) {
-              const dataStr = line.slice(6).trim();
-              if (dataStr === '[DONE]') continue;
-              try {
-                const parsed = JSON.parse(dataStr);
-                const delta = parsed.choices?.[0]?.delta;
-                if (delta?.content) fullText += delta.content;
-                if (delta?.reasoning_content) reasoning += delta.reasoning_content;
-              } catch {}
-            }
-          }
-
-          resolve({ text: fullText, reasoning });
+          resolve(parseSseCompletion(raw));
         }
       }
     });
@@ -376,8 +1003,112 @@ async function callWorkBuddy(userPrompt, options = {}) {
   });
 }
 
+function getStatusInfo() {
+  const cliSession = readCliSession();
+  const discoveryFile = path.join(os.homedir(), '.workbuddy', 'wbipc', 'endpoint.json');
+  const desktopRunning = fs.existsSync(discoveryFile);
+  return {
+    cliLoggedIn: Boolean(cliSession?.auth?.accessToken),
+    authFile: AUTH_FILE,
+    endpoint: cliSession?.endpoint || DEFAULT_ENDPOINT,
+    account: cliSession?.account || null,
+    expiresAt: cliSession?.auth?.expiresAt ? new Date(cliSession.auth.expiresAt).toISOString() : null,
+    desktopWbicpRunning: desktopRunning
+  };
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+
+  if (args.command === 'login') {
+    try {
+      const session = await loginWorkBuddy({ noBrowser: args.noBrowser });
+      if (args.asJson) {
+        console.log(JSON.stringify({ ok: true, account: session.account, authFile: AUTH_FILE }, null, 2));
+      } else {
+        const who = session.account?.nickname || session.account?.uid || 'Unknown';
+        console.log(`登录成功！当前账号: ${who}`);
+        console.log(`凭据已保存至: ${AUTH_FILE}（后续无需再开启 WorkBuddy 客户端）`);
+      }
+    } catch (err) {
+      if (args.asJson) {
+        console.error(JSON.stringify({ ok: false, error: err.message }, null, 2));
+      } else {
+        console.error(`Error: ${err.message}`);
+      }
+      process.exit(1);
+    }
+    return;
+  }
+
+  if (args.command === 'logout') {
+    const result = await logoutWorkBuddy();
+    if (args.asJson) {
+      console.log(JSON.stringify({ ok: true, ...result }, null, 2));
+    } else if (!result.hadSession) {
+      console.log('当前未登录 CLI 会话。');
+    } else {
+      console.log('已退出登录并清理本地 CLI 凭据。');
+    }
+    return;
+  }
+
+  if (args.command === 'status') {
+    const info = getStatusInfo();
+    if (args.asJson) {
+      console.log(JSON.stringify({ ok: true, data: info }, null, 2));
+    } else {
+      console.log(`CLI 独立登录: ${info.cliLoggedIn ? '已登录' : '未登录'}`);
+      if (info.cliLoggedIn) {
+        const who = info.account?.nickname || info.account?.uid || '(未知用户)';
+        console.log(`当前账号: ${who}`);
+        if (info.expiresAt) console.log(`Token 过期时间: ${info.expiresAt}`);
+        console.log(`凭据文件: ${info.authFile}`);
+      }
+      console.log(`桌面端 WBIPC: ${info.desktopWbicpRunning ? '运行中' : '未运行'}`);
+    }
+    return;
+  }
+
+  if (args.command === 'models') {
+    if (args.staticModels) {
+      if (args.asJson) {
+        console.log(JSON.stringify({ ok: true, source: 'static', aliases: MODEL_ALIASES }, null, 2));
+      } else {
+        showModels();
+      }
+      return;
+    }
+
+    try {
+      const result = await scanAvailableModels({ includeAll: args.includeAllModels });
+      if (!result.models) {
+        if (args.asJson) {
+          console.log(JSON.stringify({ ok: true, source: 'static', note: result.reason, aliases: MODEL_ALIASES }, null, 2));
+        } else {
+          console.error(`提示: ${result.reason}，以下为内置静态模型清单；运行 "workbuddy login" 后可实时扫描服务端最新模型。\n`);
+          showModels();
+        }
+        return;
+      }
+
+      if (args.asJson) {
+        console.log(JSON.stringify({ ok: true, source: result.source, count: result.models.length, models: result.models }, null, 2));
+      } else {
+        printScannedModels(result.models, result.source);
+      }
+    } catch (err) {
+      if (args.asJson) {
+        console.error(JSON.stringify({ ok: false, error: err.message }, null, 2));
+      } else {
+        console.error(`扫描服务端模型失败 (${err.message})，回退到内置清单：\n`);
+        showModels();
+      }
+      process.exit(1);
+    }
+    return;
+  }
+
   let userPrompt = args.prompt;
 
   // 如果没有从命令行参数提供 prompt，检查 stdin 是否有输入（例如管道传参）

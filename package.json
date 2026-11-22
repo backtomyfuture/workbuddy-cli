@@ -1,12 +1,20 @@
 {
   "name": "workbuddy-cli",
-  "version": "1.0.0",
-  "description": "Zero-dependency CLI for Tencent WorkBuddy desktop app via native WBIPC protocol.",
+  "version": "1.1.0",
+  "description": "Zero-dependency CLI for Tencent WorkBuddy with standalone browser login/logout, live model scanning, and WBIPC fallback.",
   "type": "module",
   "main": "bin/workbuddy.mjs",
   "bin": {
     "workbuddy": "bin/workbuddy.mjs",
     "wb": "bin/workbuddy.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/backtomyfuture/workbuddy-cli.git"
+  },
+  "homepage": "https://github.com/backtomyfuture/workbuddy-cli#readme",
+  "bugs": {
+    "url": "https://github.com/backtomyfuture/workbuddy-cli/issues"
   },
   "keywords": [
     "workbuddy",

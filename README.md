@@ -67,6 +67,20 @@ ln -sf "$(pwd)/bin/workbuddy.mjs" ~/.local/bin/wb
 
 ## 💡 使用示例 / Usage Examples
 
+### 0. 独立登录 / 退出（无需保持桌面端运行）
+```bash
+# 通过浏览器扫码/账号登录，凭据保存在 ~/.workbuddy-cli/auth.json
+workbuddy login
+
+# 查看当前登录状态（CLI 独立凭据 & 桌面端 WBIPC）
+workbuddy status
+
+# 退出登录并注销服务端会话、清理本地凭据
+workbuddy logout
+```
+
+> 登录一次后即可关闭 WorkBuddy 桌面客户端，CLI 会直接通过 HTTPS 调用后端接口并在 Token 过期时自动刷新；若未执行 `workbuddy login`，仍会自动回退复用运行中的桌面端 WBIPC。
+
 ### 1. 基础问答
 ```bash
 workbuddy "用 Python 写一个支持泛型的 LRU 缓存"
@@ -106,11 +120,15 @@ workbuddy -s "你是一名资深Go开发专家" "如何避免goroutine泄漏？"
 workbuddy --json "1+1=?"
 ```
 
-### 5. 查看所有可用模型清单
+### 5. 查看 / 实时扫描可用模型清单
 ```bash
-workbuddy --models
+# 登录后自动从服务端实时扫描最新可用模型（未登录时回退到内置静态列表）
+workbuddy models
 # 或
 workbuddy -l
+
+# 包含生图等特殊标签模型 / 输出完整 JSON 元数据
+workbuddy models --all --json
 ```
 
 ---
