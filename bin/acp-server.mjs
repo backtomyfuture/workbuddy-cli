@@ -2,11 +2,19 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
+  effortChoices,
+  modelMeta,
+  parseEffort,
+  reconcileEffort,
+  resolveEffort
+} from './effort.mjs';
+import {
   createSessionId,
   listSessions,
   loadSession,
   saveSession
 } from './sessions.mjs';
+import { collectRoots, pathWithinRoots, requestedWorkspace, workspaceBrief, workspaceInfo } from './workspace.mjs';
 
 const TOOLS = [
   {
@@ -67,6 +75,8 @@ const TOOLS = [
   }
 ];
 
+const MAX_TOOL_ROUNDS = 500;
+
 const TOOL_KIND = {
   read_file: 'read',
   list_dir: 'search',
@@ -97,18 +107,15 @@ function promptToText(blocks) {
   return parts.join('\n').trim();
 }
 
-function withinCwd(cwd, target) {
-  const root = path.resolve(cwd);
-  const resolved = path.resolve(cwd, target || '.');
-  const rel = path.relative(root, resolved);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) return null;
-  return resolved;
+function sessionRoots(session) {
+  if (Array.isArray(session.roots) && session.roots.length) return session.roots;
+  return session.cwd ? [session.cwd] : [];
 }
 
 function windowMessages(messages) {
   const systems = messages.filter(message => message.role === 'system');
   const rest = messages.filter(message => message.role !== 'system');
-  const tail = rest.slice(-40);
+  const tail = rest.slice(-80);
   while (tail.length && tail[0].role === 'tool') tail.shift();
   return [...systems, ...tail];
 }
@@ -179,37 +186,73 @@ export async function runAcpServer(deps) {
     send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId, update } });
   }
 
-  function modelCatalog(current) {
+  function modelCatalog(session) {
     const models = deps.models.map(model => ({ ...model }));
-    if (current && !models.some(model => model.modelId === current)) {
-      models.unshift({ modelId: current, name: current });
+    if (session.model && !models.some(model => model.modelId === session.model)) {
+      models.unshift({ modelId: session.model, name: session.model });
     }
-    return models;
+    return models.map(model => ({
+      ...model,
+      _meta: modelMeta(model.modelId, model.modelId === session.model ? session.effort : null)
+    }));
   }
 
   function sessionPayload(session) {
-    const availableModels = modelCatalog(session.model);
+    const availableModels = modelCatalog(session);
+    const choices = effortChoices(session.model);
+    const configOptions = [
+      {
+        id: 'model',
+        name: 'Model',
+        category: 'model',
+        type: 'select',
+        currentValue: session.model,
+        options: availableModels.map(model => ({ value: model.modelId, name: model.name }))
+      }
+    ];
+    if (choices.length) {
+      configOptions.push({
+        id: 'thought_level',
+        name: '思考等级',
+        description: 'Reasoning effort',
+        category: 'thought_level',
+        type: 'select',
+        currentValue: session.effort || choices[0].value,
+        options: choices
+      });
+    }
+    const workspace = workspaceInfo(sessionRoots(session));
     return {
       sessionId: session.id,
       models: {
         currentModelId: session.model,
         availableModels
       },
-      configOptions: [
-        {
-          id: 'model',
-          name: 'Model',
-          category: 'model',
-          type: 'select',
-          currentValue: session.model,
-          options: availableModels.map(model => ({ value: model.modelId, name: model.name }))
-        }
-      ]
+      configOptions,
+      _meta: {
+        workspace: workspace.root,
+        name: workspace.name,
+        isGitWorkspace: workspace.isGitWorkspace,
+        additionalDirectories: workspace.additionalDirectories
+      }
     };
   }
 
-  function systemPrompt(cwd) {
-    return `You are WorkBuddy, a coding assistant connected through the Agent Client Protocol. The working directory is ${cwd}. Use read_file, list_dir, write_file, and bash to inspect and change the project. Do not invent file contents. Reply in the user's language.`;
+  function systemPrompt(roots) {
+    return `${workspaceBrief(roots)}\n不要编造文件内容。能回答时就停止调用工具。用用户使用的语言回复。`;
+  }
+
+  function bindWorkspace(session, cwd, additional) {
+    const roots = collectRoots(cwd || session.cwd, additional);
+    if (roots.length) {
+      session.cwd = roots[0];
+      session.roots = roots;
+    }
+    const content = systemPrompt(sessionRoots(session));
+    const first = session.messages?.[0];
+    if (first?.role === 'system') first.content = content;
+    else session.messages = [{ role: 'system', content }, ...(session.messages || [])];
+    return session;
   }
 
   function activate(session) {
@@ -249,7 +292,8 @@ export async function runAcpServer(deps) {
   }
 
   async function readFile(session, filePath, signal) {
-    const absolute = path.resolve(session.cwd, filePath);
+    const absolute = pathWithinRoots(sessionRoots(session), filePath);
+    if (!absolute) return `拒绝读取工作区之外的文件: ${filePath}`;
     if (clientCapabilities.fs?.readTextFile) {
       const result = await rpcCall('fs/read_text_file', {
         sessionId: session.id,
@@ -259,13 +303,11 @@ export async function runAcpServer(deps) {
       }, signal);
       return result?.content ?? '';
     }
-    const local = withinCwd(session.cwd, filePath);
-    if (!local) return `拒绝读取工作区之外的文件: ${filePath}`;
-    return fs.readFileSync(local, 'utf8');
+    return fs.readFileSync(absolute, 'utf8');
   }
 
   function listDir(session, dirPath) {
-    const local = withinCwd(session.cwd, dirPath || '.');
+    const local = pathWithinRoots(sessionRoots(session), dirPath || '.');
     if (!local) return `拒绝列出工作区之外的目录: ${dirPath || '.'}`;
     const entries = fs.readdirSync(local, { withFileTypes: true });
     return entries
@@ -275,7 +317,8 @@ export async function runAcpServer(deps) {
   }
 
   async function writeFile(session, filePath, content, signal) {
-    const absolute = path.resolve(session.cwd, filePath);
+    const absolute = pathWithinRoots(sessionRoots(session), filePath);
+    if (!absolute) return `拒绝写入工作区之外的文件: ${filePath}`;
     if (clientCapabilities.fs?.writeTextFile) {
       await rpcCall('fs/write_text_file', {
         sessionId: session.id,
@@ -284,11 +327,9 @@ export async function runAcpServer(deps) {
       }, signal);
       return `已写入 ${absolute}`;
     }
-    const local = withinCwd(session.cwd, filePath);
-    if (!local) return `拒绝写入工作区之外的文件: ${filePath}`;
-    fs.mkdirSync(path.dirname(local), { recursive: true });
-    fs.writeFileSync(local, String(content ?? ''));
-    return `已写入 ${local}`;
+    fs.mkdirSync(path.dirname(absolute), { recursive: true });
+    fs.writeFileSync(absolute, String(content ?? ''));
+    return `已写入 ${absolute}`;
   }
 
   async function runBash(session, command, signal) {
@@ -411,7 +452,7 @@ export async function runAcpServer(deps) {
     const planNote = session.mode === 'plan'
       ? [{ role: 'system', content: 'Plan mode is active. Do not modify files or run commands. Read the project and answer with a plan.' }]
       : [];
-    for (let round = 0; round < 12; round += 1) {
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
       if (signal.aborted) {
         const err = new Error('cancelled');
         err.name = 'AbortError';
@@ -422,6 +463,7 @@ export async function runAcpServer(deps) {
       const result = await deps.completeChat({
         messages,
         model: session.model || defaultModel,
+        effort: session.effort,
         tools: session.mode === 'plan' ? TOOLS.filter(tool => tool.function.name === 'read_file' || tool.function.name === 'list_dir') : TOOLS,
         signal,
         timeoutMs: 180000,
@@ -482,7 +524,7 @@ export async function runAcpServer(deps) {
       session.updatedAt = Date.now();
       saveSession(session);
     }
-    const text = '已达到单轮工具调用上限，停在这里。';
+    const text = `已达到单轮 ${MAX_TOOL_ROUNDS} 次模型调用上限，先停在这里。再发一条消息可以接着做。`;
     notify(session.id, {
       sessionUpdate: 'agent_message_chunk',
       content: { type: 'text', text }
@@ -520,6 +562,7 @@ export async function runAcpServer(deps) {
     const controller = new AbortController();
     aborters.set(session.id, controller);
     try {
+      bindWorkspace(session, session.cwd, session.roots?.slice(1));
       if (!session.title) session.title = text.slice(0, 48);
       session.messages.push({ role: 'user', content: text });
       session.updatedAt = Date.now();
@@ -575,6 +618,12 @@ export async function runAcpServer(deps) {
             image: false,
             audio: false,
             embeddedContext: true
+          },
+          sessionCapabilities: {
+            list: {},
+            resume: {},
+            close: {},
+            additionalDirectories: {}
           }
         },
         agentInfo: {
@@ -598,18 +647,18 @@ export async function runAcpServer(deps) {
       return;
     }
     if (method === 'session/new') {
-      const cwd = params?.cwd || process.cwd();
       const model = params?.model || params?._meta?.model || defaultModel;
-      const session = activate(saveSession({
+      const session = activate(saveSession(bindWorkspace({
         id: createSessionId(),
-        cwd,
+        cwd: process.cwd(),
         model,
+        effort: resolveEffort(model).effort,
         title: '',
         mode: 'default',
         createdAt: Date.now(),
         updatedAt: Date.now(),
-        messages: [{ role: 'system', content: systemPrompt(cwd) }]
-      }));
+        messages: []
+      }, requestedWorkspace(params) || process.cwd(), params?.additionalDirectories)));
       reply(id, sessionPayload(session));
       return;
     }
@@ -619,7 +668,8 @@ export async function runAcpServer(deps) {
         fail(id, -32002, `Session not found: ${params?.sessionId || ''}`);
         return;
       }
-      if (params?.cwd) session.cwd = params.cwd;
+      bindWorkspace(session, requestedWorkspace(params) || session.cwd, params?.additionalDirectories);
+      saveSession(session);
       replay(session);
       reply(id, sessionPayload(session));
       return;
@@ -655,6 +705,7 @@ export async function runAcpServer(deps) {
         return;
       }
       session.model = params?.modelId || session.model;
+      session.effort = reconcileEffort(session.model, session.effort);
       session.updatedAt = Date.now();
       saveSession(session);
       reply(id, sessionPayload(session));
@@ -666,7 +717,22 @@ export async function runAcpServer(deps) {
         fail(id, -32002, `Session not found: ${params?.sessionId || ''}`);
         return;
       }
-      if (params?.configId === 'model' && params?.value) session.model = String(params.value);
+      if (params?.configId === 'model' && params?.value) {
+        session.model = String(params.value);
+        session.effort = reconcileEffort(session.model, session.effort);
+      } else if (params?.configId === 'thought_level') {
+        const parsed = parseEffort(params?.value);
+        if (parsed == null) {
+          fail(id, -32602, 'Invalid thought_level');
+          return;
+        }
+        const resolved = resolveEffort(session.model, parsed);
+        if (resolved.error) {
+          fail(id, -32602, resolved.error);
+          return;
+        }
+        session.effort = resolved.effort;
+      }
       session.updatedAt = Date.now();
       saveSession(session);
       reply(id, {

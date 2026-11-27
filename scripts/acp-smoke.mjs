@@ -3,6 +3,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { accountDefaultModel, acpModelsFromCatalog } from '../bin/catalog.mjs';
+import { defaultEffort, effortChoices, installModelProfiles, modelMeta } from '../bin/effort.mjs';
+import { collectRoots, pathWithinRoots, requestedWorkspace, workspaceBrief, workspaceInfo } from '../bin/workspace.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const cli = path.join(root, 'bin', 'workbuddy.mjs');
@@ -118,6 +121,7 @@ async function testAcp() {
     const init = await next();
     assert(init.id === 1 && init.result.protocolVersion === 1, JSON.stringify(init));
     assert(init.result.agentCapabilities.loadSession === true, 'loadSession missing');
+    assert(init.result.agentCapabilities.sessionCapabilities?.additionalDirectories, 'additionalDirectories missing');
 
     send({ jsonrpc: '2.0', id: 2, method: 'nope', params: {} });
     const missing = await next();
@@ -128,6 +132,30 @@ async function testAcp() {
     sessionId = created.result.sessionId;
     assert(sessionId, JSON.stringify(created));
     assert(created.result.models.availableModels.length > 0, 'models missing');
+    assert(created.result._meta?.workspace && created.result._meta.isGitWorkspace === true, JSON.stringify(created.result._meta));
+    const thought = created.result.configOptions.find(option => option.id === 'thought_level');
+    assert(thought?.category === 'thought_level' && thought.currentValue === 'medium', JSON.stringify(thought));
+    const deepseek = created.result.models.availableModels.find(model => model.modelId === 'deepseek-v3-2-volc');
+    assert(deepseek?._meta?.supportsReasoningEffort === true && deepseek._meta.reasoningEfforts?.length > 0, 'reasoning meta missing');
+    const auto = created.result.models.availableModels.find(model => model.modelId === 'auto');
+    assert(auto?._meta?.supportsReasoningEffort === false, 'auto should not advertise reasoning');
+    send({
+      jsonrpc: '2.0',
+      id: 31,
+      method: 'session/set_config_option',
+      params: { sessionId, configId: 'thought_level', value: 'high' }
+    });
+    const effortSet = await next();
+    const updated = effortSet.result?.configOptions?.find(option => option.id === 'thought_level');
+    assert(updated?.currentValue === 'high', JSON.stringify(effortSet));
+    send({
+      jsonrpc: '2.0',
+      id: 32,
+      method: 'session/set_config_option',
+      params: { sessionId, configId: 'thought_level', value: 'off' }
+    });
+    const rejected = await next();
+    assert(rejected.error?.code === -32602, JSON.stringify(rejected));
 
     send({
       jsonrpc: '2.0',
@@ -210,7 +238,50 @@ async function testAcp() {
   }
 }
 
+function testWorkspace() {
+  const roots = collectRoots(root, [os.homedir()]);
+  assert(roots[0] === fs.realpathSync(root), roots[0]);
+  assert(roots.includes(fs.realpathSync(os.homedir())), 'home root missing');
+  const brief = workspaceBrief(roots);
+  assert(brief.includes(`路径：${roots[0]}`), 'brief missing cwd');
+  assert(workspaceInfo(roots).isGitWorkspace === true, 'repo should be git');
+  assert(requestedWorkspace({ workingDirectory: roots[0] }) === roots[0], 'workingDirectory');
+  assert(brief.includes('package.json') || brief.includes('bin'), brief);
+  assert(workspaceBrief([fs.realpathSync(os.homedir())]).includes('用户主目录'), 'home warning missing');
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'scratch-'));
+  const scratchRoot = path.join(scratch, '.t3', 'scratch', 'demo');
+  fs.mkdirSync(scratchRoot, { recursive: true });
+  assert(workspaceBrief([scratchRoot]).includes('临时草稿目录'), 'scratch warning missing');
+  assert(pathWithinRoots(roots, 'bin/workbuddy.mjs'), 'repo file should be inside roots');
+  assert(pathWithinRoots([roots[0]], path.join(os.homedir(), 'outside')) === null, 'outside path should be rejected');
+  fs.rmSync(scratch, { recursive: true, force: true });
+}
+
+function testCatalog() {
+  const sample = [
+    { id: 'auto', name: 'Auto', isDefault: true, supportsToolCall: true, supportsReasoning: true, onlyReasoning: true, reasoning: { effort: 'high', summary: 'auto' } },
+    { id: 'hy4flash-free', name: 'Hy4 flash', isDefault: true, supportsToolCall: true, supportsReasoning: true, onlyReasoning: true, tags: ['badge:限时免费:#FF0000'], reasoning: { defaultEffort: 'high', supportedEfforts: ['high'], canDisableThinking: false } },
+    { id: 'hy4flash', name: 'Hy4 flash', isDefault: true, supportsToolCall: true, supportsReasoning: true, onlyReasoning: true, credits: 'x0.03', reasoning: { defaultEffort: 'high', supportedEfforts: ['high'], canDisableThinking: false } },
+    { id: 'deepseek-v3-2-volc', name: 'DeepSeek-V3.2', supportsToolCall: true, supportsReasoning: true, onlyReasoning: true, reasoning: { effort: 'medium', summary: 'auto' } },
+    { id: 'hunyuan-chat', name: 'Hunyuan-Turbos', supportsToolCall: true },
+    { id: 'kling-video-v3', name: 'Kling-Video-V3', tags: ['text-to-video', 'image-to-video'] }
+  ];
+  installModelProfiles(sample);
+  const listed = acpModelsFromCatalog(sample);
+  assert(listed.map(model => model.modelId).join(',') === 'auto,hy4flash-free,hy4flash,deepseek-v3-2-volc,hunyuan-chat', listed.map(model => model.modelId).join(','));
+  assert(listed.find(model => model.modelId === 'hy4flash-free').name === 'Hy4 flash（限时免费）', 'free flash name');
+  assert(listed.find(model => model.modelId === 'hy4flash').name === 'Hy4 flash（x0.03）', 'paid flash name');
+  assert(accountDefaultModel(sample) === 'auto', 'account default');
+  assert(defaultEffort('auto') === 'high', 'auto effort');
+  assert(effortChoices('hy4flash-free').map(choice => choice.value).join(',') === 'high', 'flash efforts');
+  assert(!effortChoices('auto').some(choice => choice.value === 'off'), 'auto cannot turn off');
+  assert(modelMeta('hunyuan-chat').supportsReasoningEffort === false, 'chat model has no effort');
+  installModelProfiles([]);
+}
+
 try {
+  testWorkspace();
+  testCatalog();
   await testCliSessions();
   await testAcp();
   fs.rmSync(home, { recursive: true, force: true });

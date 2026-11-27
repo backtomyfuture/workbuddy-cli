@@ -101,6 +101,7 @@ wb "用 Python 写一个支持泛型的 LRU 缓存"
 | `-r, --resume [id]` | 按 id 继续；不写 id 时列出已保存对话 |
 | `--session-id <id>` | 新建对话时指定 id |
 | `-m, --model <id>` | 指定模型 ID 或简写别名（默认：`deepseek-v3-2-volc`） |
+| `--effort <level>` | 思考等级：`minimal`、`low`、`medium`、`high`、`xhigh`、`max`，或 `off`。继续对话时沿用上次的等级 |
 | `-s, --system <prompt>` | 设定 System Prompt |
 | `-p, --print` | 打印结果后退出（默认行为） |
 | `--json` | 输出结构化 JSON（包含完整 `reasoning` 思考过程） |
@@ -167,10 +168,10 @@ T3 Code 会把本地 ACP 代理拉成子进程，用换行分隔的 JSON-RPC 走
 | `session/prompt` | 流式发送 `agent_message_chunk` / `agent_thought_chunk`，结束后返回 `stopReason`。 |
 | `session/cancel` | 中断当前这一轮。 |
 | `session/close` | 只卸掉内存中的会话，磁盘记录还在。 |
-| `session/set_model`、`session/set_config_option` | 切换后续轮次的模型。 |
+| `session/set_model`、`session/set_config_option` | 切换后续轮次的模型。`thought_level` 是思考等级。 |
 | `session/set_mode` | `plan` 时不改文件、不跑命令。 |
 
-一轮对话里模型可以调用 `read_file`、`list_dir`、`write_file` 和 `bash`。写文件、跑命令和读文件会先发 `session/request_permission`；T3 声明了 `fs/*` 时，读写走客户端，不直接碰磁盘。
+一轮对话里模型可以调用 `read_file`、`list_dir`、`write_file` 和 `bash`，最多 500 次模型调用。写文件、跑命令和读文件会先发 `session/request_permission`；T3 声明了 `fs/*` 时，读写走客户端，不直接碰磁盘。已登录时，T3 的模型列表就是 `workbuddy models` 扫到的可对话模型，默认选账号标记的第一个默认模型；生图、生视频不放进这个列表。支持推理的模型会在 `session/new` 里带 `thought_level` 和 `_meta.reasoningEfforts`，思考等级按该模型在服务端的配置给出。T3 Code 用这两项显示思考等级。工作空间沿用桌面端：`session/new` 的 `cwd`（也认 `workingDirectory`）就是项目目录，并带上系统、Shell、是否 Git 仓库和顶层文件。`additionalDirectories` 是额外放行目录。根目录的 `AGENTS.md` 或 `CODEBUDDY.md` 会放进提示。主目录和 `~/.t3/scratch` 草稿目录会说明不是项目。
 
 桌面端自带的 CodeBuddy 也能说 ACP（`codebuddy --acp`）。这台机器上未解包的完整包需要 `CODEBUDDY_FORCE_LITE_WB_BUNDLE=1` 才能从现有入口启动。`workbuddy acp` 用的是本 CLI 自己的登录态和会话记录。
 

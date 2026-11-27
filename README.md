@@ -101,6 +101,7 @@ wb "Write a generic LRU cache in Python"
 | `-r, --resume [id]` | Resume one conversation; without an id, list saved conversations |
 | `--session-id <id>` | Use this id when starting a new conversation |
 | `-m, --model <id>` | Model ID or shorthand alias (default: `deepseek-v3-2-volc`) |
+| `--effort <level>` | Reasoning effort: `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `off`. Continued chats keep the previous level |
 | `-s, --system <prompt>` | Set a system prompt |
 | `-p, --print` | Print response and exit (default behavior) |
 | `--json` | Output structured JSON (includes `reasoning` when available) |
@@ -167,10 +168,10 @@ The server negotiates ACP v1 and implements:
 | `session/prompt` | Streams `agent_message_chunk` / `agent_thought_chunk`, then returns `stopReason`. |
 | `session/cancel` | Aborts the in-flight turn. |
 | `session/close` | Drops the in-memory session. The transcript stays on disk. |
-| `session/set_model`, `session/set_config_option` | Changes the model for later turns. |
+| `session/set_model`, `session/set_config_option` | Changes the model for later turns. `thought_level` is the reasoning effort. |
 | `session/set_mode` | `plan` disables edits and shell commands. |
 
-During a turn the agent can call `read_file`, `list_dir`, `write_file`, and `bash`. Writes, shell commands, and reads ask `session/request_permission`, then use the client's `fs/*` or `terminal` capability when T3 advertises it.
+During a turn the agent can call `read_file`, `list_dir`, `write_file`, and `bash`, up to 500 model rounds. Writes, shell commands, and reads ask `session/request_permission`, then use the client's `fs/*` or `terminal` capability when T3 advertises it. When logged in, T3's model list is the chat-capable slice of `workbuddy models`, and a new session starts on the account's first default model. Image and video models stay out of that list. Reasoning models advertise `thought_level` and `_meta.reasoningEfforts` from the server catalog, which T3 Code uses to show the thinking level.
 
 The desktop CodeBuddy binary already speaks ACP too (`codebuddy --acp`). On this machine the unpacked entrypoint only loads if `CODEBUDDY_FORCE_LITE_WB_BUNDLE=1`. `workbuddy acp` is the integration that uses this CLI's own login and transcript store.
 

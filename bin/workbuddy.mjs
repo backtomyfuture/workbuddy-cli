@@ -7,6 +7,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runAcpServer } from './acp-server.mjs';
+import { accountDefaultModel, acpModelsFromCatalog } from './catalog.mjs';
+import { applyReasoning, installModelProfiles, parseEffort, resolveEffort } from './effort.mjs';
 import {
   authFilePath,
   cliHome,
@@ -232,6 +234,7 @@ Options:
   -r, --resume [id]       Resume a conversation by id, or list conversations when omitted
   --session-id <id>       Pin the session id for a new conversation
   -m, --model <model>     Model name or alias (e.g. hy4, deepseek, glm, default: deepseek-v3-2-volc)
+  --effort <level>        Reasoning effort: minimal, low, medium, high, xhigh, max, or off
   -l, --models            Scan/list available models and aliases
   --all                   Include specialized/image models when listing models
   --static                Show built-in static model list without querying server
@@ -248,6 +251,7 @@ Examples:
   workbuddy resume wb_abc123 "再补上测试"
   workbuddy sessions
   workbuddy -m hy4 "帮我写一封商务邮件"
+  workbuddy --effort high "先看结构再改"
   cat document.txt | workbuddy -p "总结主要内容"
   workbuddy acp
   workbuddy logout
@@ -269,6 +273,8 @@ function parseArgs(args) {
   let resumeId = undefined;
   let expectResumeId = false;
   let sessionId = '';
+  let effort = '';
+  let effortExplicit = false;
 
   const first = args[0];
   if (first === 'login' || first === '--login') {
@@ -338,6 +344,12 @@ function parseArgs(args) {
     } else if (arg.startsWith('--model=')) {
       model = arg.slice(8);
       modelExplicit = true;
+    } else if (arg === '--effort') {
+      effort = args[++i] || '';
+      effortExplicit = true;
+    } else if (arg.startsWith('--effort=')) {
+      effort = arg.slice('--effort='.length);
+      effortExplicit = true;
     } else if (arg === '-s' || arg === '--system') {
       systemPrompt = args[++i];
       systemExplicit = true;
@@ -374,7 +386,9 @@ function parseArgs(args) {
     staticModels,
     continueSession,
     resumeId,
-    sessionId
+    sessionId,
+    effort,
+    effortExplicit
   };
 }
 
@@ -1063,6 +1077,7 @@ function chatPayload(userPrompt, options = {}) {
   }
   const payload = { model, messages, stream: true };
   if (tools?.length) payload.tools = tools;
+  applyReasoning(payload, options.effort);
   return payload;
 }
 
@@ -1432,14 +1447,31 @@ async function main() {
 
   if (args.command === 'acp') {
     const pkgPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
-    let version = '1.2.0';
+    let version = '1.3.0';
     try {
       version = JSON.parse(fs.readFileSync(pkgPath, 'utf8')).version || version;
     } catch {}
+    let models = acpModels();
+    let defaultModel = args.modelExplicit ? args.model : DEFAULT_MODEL;
+    if (process.env.WORKBUDDY_ACP_MOCK !== '1') {
+      try {
+        const result = await scanAvailableModels();
+        if (result.models?.length) {
+          installModelProfiles(result.models);
+          const live = acpModelsFromCatalog(result.models);
+          if (live.length) {
+            models = live;
+            if (!args.modelExplicit) defaultModel = accountDefaultModel(result.models) || defaultModel;
+          }
+        }
+      } catch (err) {
+        console.error(`模型列表扫描失败，T3 将使用内置清单: ${err.message}`);
+      }
+    }
     await runAcpServer({
       version,
-      defaultModel: args.modelExplicit ? args.model : DEFAULT_MODEL,
-      models: acpModels(),
+      defaultModel,
+      models,
       isLoggedIn: () => process.env.WORKBUDDY_ACP_MOCK === '1' || Boolean(readCliSession()?.auth?.accessToken),
       logout: logoutWorkBuddy,
       completeChat: options => callWorkBuddy('', options)
@@ -1492,17 +1524,37 @@ async function main() {
   }
   messages.push({ role: 'user', content: userPrompt });
   const model = args.modelExplicit ? args.model : (stored?.model || args.model);
+  let effort;
+  if (args.effortExplicit) {
+    effort = parseEffort(args.effort);
+    if (effort == null) {
+      const message = '思考等级只能是 minimal、low、medium、high、xhigh、max 或 off';
+      if (args.asJson) console.error(JSON.stringify({ ok: false, error: message }, null, 2));
+      else console.error(`Error: ${message}`);
+      process.exit(1);
+    }
+  } else if (stored && Object.prototype.hasOwnProperty.call(stored, 'effort')) {
+    effort = stored.effort;
+  }
+  const resolvedEffort = resolveEffort(model, effort);
+  if (resolvedEffort.error) {
+    if (args.asJson) console.error(JSON.stringify({ ok: false, error: resolvedEffort.error }, null, 2));
+    else console.error(`Error: ${resolvedEffort.error}`);
+    process.exit(1);
+  }
 
   try {
     const result = await callWorkBuddy(userPrompt, {
       model,
       messages,
-      systemPrompt: args.systemPrompt
+      systemPrompt: args.systemPrompt,
+      effort: resolvedEffort.effort
     });
     const saved = saveSession({
       id: stored?.id || args.sessionId || createSessionId(),
       cwd: stored?.cwd || process.cwd(),
       model,
+      effort: resolvedEffort.effort,
       title: stored?.title || userPrompt.slice(0, 48),
       mode: stored?.mode || 'default',
       createdAt: stored?.createdAt || Date.now(),
@@ -1514,7 +1566,7 @@ async function main() {
     });
 
     if (args.asJson) {
-      console.log(JSON.stringify({ ok: true, data: { ...result, sessionId: saved.id } }, null, 2));
+      console.log(JSON.stringify({ ok: true, data: { ...result, sessionId: saved.id, effort: saved.effort } }, null, 2));
     } else {
       if (result.reasoning && process.env.WORKBUDDY_SHOW_REASONING === '1') {
         console.error(`[思考过程]\n${result.reasoning}\n`);
