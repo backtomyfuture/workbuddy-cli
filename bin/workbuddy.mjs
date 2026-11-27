@@ -5,13 +5,25 @@ import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { runAcpServer } from './acp-server.mjs';
+import {
+  authFilePath,
+  cliHome,
+  createSessionId,
+  latestSession,
+  listSessions,
+  loadSession,
+  saveSession
+} from './sessions.mjs';
 
 const PROTOCOL_VERSION = 1;
 const DEFAULT_ENDPOINT = 'https://www.workbuddy.cn';
 const AUTH_PREFIX = '/v2/plugin';
 const AUTH_PLATFORM = 'workbuddy';
-const AUTH_DIR = path.join(os.homedir(), '.workbuddy-cli');
-const AUTH_FILE = path.join(AUTH_DIR, 'auth.json');
+const DEFAULT_MODEL = 'deepseek-v3-2-volc';
+const AUTH_DIR = cliHome();
+const AUTH_FILE = authFilePath();
 const LOGIN_POLL_INTERVAL_MS = 1500;
 const LOGIN_TIMEOUT_MS = 300000;
 const LOGIN_TOKEN_PENDING_CODE = 11217;
@@ -82,6 +94,55 @@ const MODEL_ALIASES = {
   'space-bunny': 'space-bunny',
   'wb-lite': 'wb-lite'
 };
+
+const ACP_MODELS = [
+  ['deepseek-v3-2-volc', 'DeepSeek V3.2'],
+  ['deepseek-v4.1-flash', 'DeepSeek V4.1 Flash'],
+  ['deepseek-v4-pro', 'DeepSeek V4 Pro'],
+  ['hy4', '混元 4.0'],
+  ['glm-5.3', 'GLM-5.3'],
+  ['kimi-k3.1-pro', 'Kimi K3.1 Pro'],
+  ['kimi-k2.5', 'Kimi K2.5'],
+  ['minimax-m3.1-flash', 'MiniMax M3.1 Flash'],
+  ['auto', 'Auto'],
+  ['fast-model', 'Fast'],
+  ['balanced-model', 'Balanced'],
+  ['deep-model', 'Deep']
+];
+
+function acpModels() {
+  return ACP_MODELS.map(([modelId, name]) => ({ modelId, name }));
+}
+
+function printSessions(asJson) {
+  const sessions = listSessions();
+  if (asJson) {
+    console.log(JSON.stringify({
+      ok: true,
+      sessions: sessions.map(session => ({
+        id: session.id,
+        title: session.title || '',
+        cwd: session.cwd,
+        model: session.model,
+        updatedAt: session.updatedAt,
+        messages: Array.isArray(session.messages) ? session.messages.length : 0
+      }))
+    }, null, 2));
+    return;
+  }
+  if (!sessions.length) {
+    console.log('还没有保存的会话。直接提问一次后，可用 workbuddy -c 继续。');
+    return;
+  }
+  console.log('已保存的会话（最近在前）:\n');
+  for (const session of sessions.slice(0, 30)) {
+    const when = session.updatedAt ? new Date(session.updatedAt).toISOString().replace('T', ' ').slice(0, 16) : '-';
+    console.log(`  ${session.id}  ${when}  ${session.model || ''}`);
+    console.log(`    ${session.title || '(无标题)'}  ${session.cwd || ''}`);
+  }
+  console.log('\n继续当前目录最近一条：workbuddy -c "..."');
+  console.log('按 id 继续：workbuddy resume <id> "..."');
+}
 
 function showModels() {
   console.log(`WorkBuddy 完整模型清单（经实测 200 OK 确认可用）:
@@ -157,12 +218,19 @@ Commands:
   logout                  Revoke session and remove local CLI credentials
   status, whoami          Show current CLI auth and desktop WBIPC status
   models                  Scan available models from server (falls back to static list)
+  sessions                List saved CLI conversations
+  continue [prompt]       Continue the most recent conversation in this directory
+  resume [id] [prompt]    Resume a conversation by id (or a unique prefix)
+  acp                     Speak Agent Client Protocol on stdin/stdout (for T3 Code)
 
 Arguments:
   prompt                  Your prompt / question
 
 Options:
   -p, --print             Print response and exit (default behavior)
+  -c, --continue          Continue the most recent conversation in this directory
+  -r, --resume [id]       Resume a conversation by id, or list conversations when omitted
+  --session-id <id>       Pin the session id for a new conversation
   -m, --model <model>     Model name or alias (e.g. hy4, deepseek, glm, default: deepseek-v3-2-volc)
   -l, --models            Scan/list available models and aliases
   --all                   Include specialized/image models when listing models
@@ -176,9 +244,12 @@ Examples:
   workbuddy login
   workbuddy models
   workbuddy "用Python写一个快速排序"
+  workbuddy -c "把刚才的例子改成迭代版本"
+  workbuddy resume wb_abc123 "再补上测试"
+  workbuddy sessions
   workbuddy -m hy4 "帮我写一封商务邮件"
   cat document.txt | workbuddy -p "总结主要内容"
-  workbuddy --model glm "写一首五言绝句"
+  workbuddy acp
   workbuddy logout
 `);
 }
@@ -186,12 +257,18 @@ Examples:
 function parseArgs(args) {
   let command = 'chat';
   let prompt = '';
-  let model = 'deepseek-v3-2-volc';
+  let model = DEFAULT_MODEL;
+  let modelExplicit = false;
   let asJson = false;
   let systemPrompt = '';
+  let systemExplicit = false;
   let noBrowser = false;
   let includeAllModels = false;
   let staticModels = false;
+  let continueSession = false;
+  let resumeId = undefined;
+  let expectResumeId = false;
+  let sessionId = '';
 
   const first = args[0];
   if (first === 'login' || first === '--login') {
@@ -205,6 +282,20 @@ function parseArgs(args) {
     args = args.slice(1);
   } else if (first === 'models') {
     command = 'models';
+    args = args.slice(1);
+  } else if (first === 'sessions') {
+    command = 'sessions';
+    args = args.slice(1);
+  } else if (first === 'acp') {
+    command = 'acp';
+    args = args.slice(1);
+  } else if (first === 'continue') {
+    command = 'chat';
+    continueSession = true;
+    args = args.slice(1);
+  } else if (first === 'resume') {
+    command = 'chat';
+    expectResumeId = true;
     args = args.slice(1);
   }
 
@@ -225,16 +316,41 @@ function parseArgs(args) {
       includeAllModels = true;
     } else if (arg === '--static') {
       staticModels = true;
+    } else if (arg === '-c' || arg === '--continue') {
+      continueSession = true;
+    } else if (arg === '-r' || arg === '--resume') {
+      const next = args[i + 1];
+      if (next && !next.startsWith('-')) {
+        resumeId = next;
+        i += 1;
+      } else {
+        resumeId = '';
+      }
+    } else if (arg.startsWith('--resume=')) {
+      resumeId = arg.slice('--resume='.length);
+    } else if (arg === '--session-id') {
+      sessionId = args[++i] || '';
+    } else if (arg.startsWith('--session-id=')) {
+      sessionId = arg.slice('--session-id='.length);
     } else if (arg === '-m' || arg === '--model') {
       model = args[++i];
+      modelExplicit = true;
     } else if (arg.startsWith('--model=')) {
       model = arg.slice(8);
+      modelExplicit = true;
     } else if (arg === '-s' || arg === '--system') {
       systemPrompt = args[++i];
+      systemExplicit = true;
     } else if (arg.startsWith('--system=')) {
       systemPrompt = arg.slice(9);
+      systemExplicit = true;
     } else if (!arg.startsWith('-')) {
-      prompt = prompt ? `${prompt} ${arg}` : arg;
+      if (expectResumeId && resumeId === undefined) {
+        resumeId = arg;
+        expectResumeId = false;
+      } else {
+        prompt = prompt ? `${prompt} ${arg}` : arg;
+      }
     }
   }
 
@@ -243,7 +359,23 @@ function parseArgs(args) {
     model = MODEL_ALIASES[model.toLowerCase()];
   }
 
-  return { command, prompt, model, asJson, systemPrompt, noBrowser, includeAllModels, staticModels };
+  if (resumeId === undefined && expectResumeId) resumeId = '';
+
+  return {
+    command,
+    prompt,
+    model,
+    modelExplicit,
+    asJson,
+    systemPrompt,
+    systemExplicit,
+    noBrowser,
+    includeAllModels,
+    staticModels,
+    continueSession,
+    resumeId,
+    sessionId
+  };
 }
 
 function encodeTranscript(role, t) {
@@ -545,24 +677,143 @@ async function logoutWorkBuddy() {
   return { hadSession: true, serverRevoked };
 }
 
-function parseSseCompletion(raw) {
-  let fullText = '';
+function createSseAccumulator(onDelta, onReasoning) {
+  let text = '';
   let reasoning = '';
+  let raw = '';
+  const toolCalls = new Map();
 
-  for (const line of raw.split('\n')) {
-    if (line.startsWith('data: ')) {
-      const dataStr = line.slice(6).trim();
-      if (dataStr === '[DONE]') continue;
-      try {
-        const parsed = JSON.parse(dataStr);
-        const delta = parsed.choices?.[0]?.delta;
-        if (delta?.content) fullText += delta.content;
-        if (delta?.reasoning_content) reasoning += delta.reasoning_content;
-      } catch {}
+  const absorbMessage = message => {
+    if (!message) return;
+    if (message.content) {
+      text += message.content;
+      onDelta?.(message.content);
     }
-  }
+    if (message.reasoning_content) {
+      reasoning += message.reasoning_content;
+      onReasoning?.(message.reasoning_content);
+    }
+    for (const call of message.tool_calls || []) {
+      const idx = call.index ?? toolCalls.size;
+      toolCalls.set(idx, {
+        id: call.id || `call_${idx}`,
+        name: call.function?.name || '',
+        arguments: call.function?.arguments || ''
+      });
+    }
+  };
 
-  return { text: fullText, reasoning };
+  return {
+    pushLine(line) {
+      raw += `${line}\n`;
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) return;
+      const dataStr = trimmed.slice(5).trim();
+      if (!dataStr || dataStr === '[DONE]') return;
+      let parsed;
+      try {
+        parsed = JSON.parse(dataStr);
+      } catch {
+        return;
+      }
+      if (parsed.error) {
+        const message = parsed.error.message || parsed.error.msg || JSON.stringify(parsed.error);
+        throw new Error(message);
+      }
+      const choice = parsed.choices?.[0];
+      const delta = choice?.delta;
+      if (delta?.content) {
+        text += delta.content;
+        onDelta?.(delta.content);
+      }
+      if (delta?.reasoning_content) {
+        reasoning += delta.reasoning_content;
+        onReasoning?.(delta.reasoning_content);
+      }
+      for (const call of delta?.tool_calls || []) {
+        const idx = call.index ?? 0;
+        const current = toolCalls.get(idx) || { id: '', name: '', arguments: '' };
+        if (call.id) current.id = call.id;
+        if (call.function?.name) current.name += call.function.name;
+        if (call.function?.arguments) current.arguments += call.function.arguments;
+        toolCalls.set(idx, current);
+      }
+      if (!delta && choice?.message) absorbMessage(choice.message);
+    },
+    finish() {
+      if (!text && toolCalls.size === 0) {
+        const body = raw.trim();
+        if (body.startsWith('{')) {
+          try {
+            const parsed = JSON.parse(body);
+            absorbMessage(parsed.choices?.[0]?.message);
+          } catch {}
+        }
+      }
+      return {
+        text,
+        reasoning,
+        toolCalls: [...toolCalls.values()].filter(call => call.name).map((call, index) => ({
+          ...call,
+          id: call.id || `call_${index}`
+        }))
+      };
+    }
+  };
+}
+
+function parseSseCompletion(raw) {
+  const acc = createSseAccumulator();
+  for (const line of String(raw || '').split(/\n/)) acc.pushLine(line);
+  return acc.finish();
+}
+
+async function readSseResponse(res, onDelta, onReasoning) {
+  if (!onDelta && !onReasoning) return parseSseCompletion(await res.text());
+  const acc = createSseAccumulator(onDelta, onReasoning);
+  if (!res.body?.getReader) return parseSseCompletion(await res.text());
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+    const lines = buf.split('\n');
+    buf = lines.pop() ?? '';
+    for (const line of lines) acc.pushLine(line);
+  }
+  if (buf) acc.pushLine(buf);
+  return acc.finish();
+}
+
+function mockComplete({ messages, signal, onDelta }) {
+  const lastUser = [...messages].reverse().find(message => message.role === 'user');
+  const userText = typeof lastUser?.content === 'string' ? lastUser.content : '';
+  const hasToolResult = messages.some(message => message.role === 'tool');
+  if (!hasToolResult && userText.includes('TOOL')) {
+    return Promise.resolve({
+      text: '',
+      reasoning: '',
+      toolCalls: [{ id: 'call_mock', name: 'read_file', arguments: JSON.stringify({ path: 'README.md' }) }]
+    });
+  }
+  if (userText.includes('SLOW')) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve({ text: 'mock:slow-finished', reasoning: '', toolCalls: [] }), 30000);
+      const abort = () => {
+        clearTimeout(timer);
+        const err = new Error('aborted');
+        err.name = 'AbortError';
+        reject(err);
+      };
+      if (signal?.aborted) abort();
+      else signal?.addEventListener('abort', abort, { once: true });
+    });
+  }
+  const text = hasToolResult ? 'mock-after-tool' : `mock:${userText.slice(0, 200)}`;
+  onDelta?.(text);
+  return Promise.resolve({ text, reasoning: '', toolCalls: [] });
 }
 
 async function fetchDirectApi(session, method, apiPath, body) {
@@ -782,6 +1033,61 @@ function printScannedModels(models, source) {
   console.log(`\n提示: 使用 workbuddy -m <model_id> "..." 即可直接调用任意新模型，无需等待 CLI 更新。`);
 }
 
+function chatPayload(userPrompt, options = {}) {
+  const { model = DEFAULT_MODEL, systemPrompt, tools } = options;
+  const messages = options.messages
+    ? options.messages.map(message => {
+        const next = { role: message.role, content: message.content ?? '' };
+        if (message.tool_calls) next.tool_calls = message.tool_calls;
+        if (message.tool_call_id) next.tool_call_id = message.tool_call_id;
+        if (message.name) next.name = message.name;
+        return next;
+      })
+    : [];
+  if (!options.messages) {
+    if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+    if (userPrompt) messages.push({ role: 'user', content: userPrompt });
+  } else if (!tools?.length) {
+    for (let i = 0; i < messages.length; i += 1) {
+      if (messages[i].role === 'tool') {
+        messages.splice(i, 1);
+        i -= 1;
+        continue;
+      }
+      if (messages[i].tool_calls) delete messages[i].tool_calls;
+      if (!messages[i].content) {
+        messages.splice(i, 1);
+        i -= 1;
+      }
+    }
+  }
+  const payload = { model, messages, stream: true };
+  if (tools?.length) payload.tools = tools;
+  return payload;
+}
+
+function linkAbortSignals(external, timeoutMs) {
+  const controller = new AbortController();
+  const seconds = Math.round(timeoutMs / 1000);
+  const timer = setTimeout(() => {
+    const err = new Error(`请求超时 (${seconds}s)`);
+    err.name = 'TimeoutError';
+    controller.abort(err);
+  }, timeoutMs);
+  const onAbort = () => controller.abort(external.reason);
+  if (external) {
+    if (external.aborted) controller.abort(external.reason);
+    else external.addEventListener('abort', onAbort, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    close() {
+      clearTimeout(timer);
+      external?.removeEventListener('abort', onAbort);
+    }
+  };
+}
+
 async function callWorkBuddyDirect(session, userPrompt, options = {}) {
   let activeSession = session;
   if (
@@ -792,18 +1098,8 @@ async function callWorkBuddyDirect(session, userPrompt, options = {}) {
     activeSession = await refreshCliSession(activeSession);
   }
 
-  const { model = 'deepseek-v3-2-volc', systemPrompt } = options;
-  const messages = [];
-  if (systemPrompt) {
-    messages.push({ role: 'system', content: systemPrompt });
-  }
-  messages.push({ role: 'user', content: userPrompt });
-
-  const payload = {
-    model,
-    messages,
-    stream: true
-  };
+  const payload = chatPayload(userPrompt, options);
+  const timeoutMs = options.timeoutMs || 60000;
 
   const sendRequest = async s => {
     const endpoint = (s.endpoint || DEFAULT_ENDPOINT).replace(/\/+$/, '');
@@ -820,24 +1116,32 @@ async function callWorkBuddyDirect(session, userPrompt, options = {}) {
       headers['X-Tenant-Id'] = s.account.enterpriseId;
     }
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 60000);
+    const linked = linkAbortSignals(options.signal, timeoutMs);
     try {
       const res = await fetch(`${endpoint}/v2/chat/completions`, {
         method: 'POST',
         headers,
         body: JSON.stringify(payload),
-        signal: controller.signal
+        signal: linked.signal
       });
-      const raw = await res.text();
-      return { status: res.status, raw };
+      if (!res.ok) {
+        const raw = await res.text();
+        return { status: res.status, raw, completion: null };
+      }
+      const completion = await readSseResponse(res, options.onDelta, options.onReasoning);
+      return { status: res.status, raw: '', completion };
     } catch (err) {
-      if (err?.name === 'AbortError') {
-        throw new Error('请求超时 (60s)');
+      if (err?.name === 'AbortError' || err?.name === 'TimeoutError' || linked.signal.aborted) {
+        if (options.signal?.aborted) {
+          const aborted = new Error('cancelled');
+          aborted.name = 'AbortError';
+          throw aborted;
+        }
+        throw new Error(linked.signal.reason?.message || `请求超时 (${Math.round(timeoutMs / 1000)}s)`);
       }
       throw err;
     } finally {
-      clearTimeout(timer);
+      linked.close();
     }
   };
 
@@ -858,10 +1162,18 @@ async function callWorkBuddyDirect(session, userPrompt, options = {}) {
     throw new Error(errorText);
   }
 
-  return parseSseCompletion(res.raw);
+  return res.completion;
 }
 
 async function callWorkBuddy(userPrompt, options = {}) {
+  if (process.env.WORKBUDDY_ACP_MOCK === '1') {
+    return mockComplete({
+      messages: options.messages || chatPayload(userPrompt, options).messages,
+      signal: options.signal,
+      onDelta: options.onDelta
+    });
+  }
+
   const cliSession = readCliSession();
   if (cliSession?.auth?.accessToken) {
     return callWorkBuddyDirect(cliSession, userPrompt, options);
@@ -879,18 +1191,39 @@ async function callWorkBuddy(userPrompt, options = {}) {
     throw new Error(`读取 WBIPC endpoint.json 失败: ${err.message}`);
   }
 
-  const { model = 'deepseek-v3-2-volc', systemPrompt } = options;
+  const payload = chatPayload(userPrompt, options);
+  const timeoutMs = options.timeoutMs || 60000;
 
   return new Promise((resolve, reject) => {
     const socket = net.connect({ path: discovery.endpoint });
     let buffer = Buffer.alloc(0);
     const clientNonce = crypto.randomBytes(16).toString('base64url');
     const send = frame => socket.write(JSON.stringify(frame) + '\n');
-
-    let timeoutTimer = setTimeout(() => {
+    let settled = false;
+    let timeoutTimer;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutTimer);
+      options.signal?.removeEventListener('abort', onAbort);
+      fn(value);
+    };
+    const onAbort = () => {
       socket.destroy();
-      reject(new Error('请求超时 (60s)'));
-    }, 60000);
+      const err = new Error('cancelled');
+      err.name = 'AbortError';
+      finish(reject, err);
+    };
+    if (options.signal?.aborted) {
+      onAbort();
+      return;
+    }
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+
+    timeoutTimer = setTimeout(() => {
+      socket.destroy();
+      finish(reject, new Error(`请求超时 (${Math.round(timeoutMs / 1000)}s)`));
+    }, timeoutMs);
 
     socket.on('connect', () => {
       send({
@@ -934,23 +1267,10 @@ async function callWorkBuddy(userPrompt, options = {}) {
           send({ jsonrpc: '2.0', id: 1, method: 'broker/GetPipe', params: { pipe: 'wb.request' } });
         } else if (f.id === 1) {
           if (f.error) {
-            clearTimeout(timeoutTimer);
             socket.end();
-            return reject(new Error(`GetPipe 错误: ${f.error.message}`));
+            return finish(reject, new Error(`GetPipe 错误: ${f.error.message}`));
           }
           const channel = f.result?.channel;
-          const messages = [];
-          if (systemPrompt) {
-            messages.push({ role: 'system', content: systemPrompt });
-          }
-          messages.push({ role: 'user', content: userPrompt });
-
-          const payload = {
-            model,
-            messages,
-            stream: true
-          };
-
           send({
             jsonrpc: '2.0',
             id: 2,
@@ -967,11 +1287,10 @@ async function callWorkBuddy(userPrompt, options = {}) {
             }
           });
         } else if (f.id === 2) {
-          clearTimeout(timeoutTimer);
           socket.end();
 
           if (f.error) {
-            return reject(new Error(f.error.message));
+            return finish(reject, new Error(f.error.message));
           }
 
           if (f.result?.status && f.result.status >= 400) {
@@ -983,22 +1302,24 @@ async function callWorkBuddy(userPrompt, options = {}) {
                 errorText += `: ${errJson.msg || errJson.message || bodyStr}`;
               } catch {}
             }
-            return reject(new Error(errorText));
+            return finish(reject, new Error(errorText));
           }
 
           if (!f.result || !f.result.body_b64) {
-            return resolve({ text: '', reasoning: '' });
+            return finish(resolve, { text: '', reasoning: '', toolCalls: [] });
           }
 
           const raw = Buffer.from(f.result.body_b64, 'base64').toString('utf8');
-          resolve(parseSseCompletion(raw));
+          const completion = parseSseCompletion(raw);
+          if (completion.text) options.onDelta?.(completion.text);
+          if (completion.reasoning) options.onReasoning?.(completion.reasoning);
+          finish(resolve, completion);
         }
       }
     });
 
     socket.on('error', err => {
-      clearTimeout(timeoutTimer);
-      reject(new Error(`连接 WorkBuddy 套接字失败: ${err.message}`));
+      finish(reject, new Error(`连接 WorkBuddy 套接字失败: ${err.message}`));
     });
   });
 }
@@ -1109,6 +1430,28 @@ async function main() {
     return;
   }
 
+  if (args.command === 'acp') {
+    const pkgPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
+    let version = '1.2.0';
+    try {
+      version = JSON.parse(fs.readFileSync(pkgPath, 'utf8')).version || version;
+    } catch {}
+    await runAcpServer({
+      version,
+      defaultModel: args.modelExplicit ? args.model : DEFAULT_MODEL,
+      models: acpModels(),
+      isLoggedIn: () => process.env.WORKBUDDY_ACP_MOCK === '1' || Boolean(readCliSession()?.auth?.accessToken),
+      logout: logoutWorkBuddy,
+      completeChat: options => callWorkBuddy('', options)
+    });
+    return;
+  }
+
+  if (args.command === 'sessions' || (args.resumeId === '' && !args.prompt)) {
+    printSessions(args.asJson);
+    return;
+  }
+
   let userPrompt = args.prompt;
 
   // 如果没有从命令行参数提供 prompt，检查 stdin 是否有输入（例如管道传参）
@@ -1125,19 +1468,61 @@ async function main() {
     process.exit(1);
   }
 
+  let stored = null;
+  try {
+    if (args.resumeId) {
+      stored = loadSession(args.resumeId);
+      if (!stored) throw new Error(`找不到会话 ${args.resumeId}。运行 workbuddy sessions 查看已保存的对话。`);
+    } else if (args.continueSession) {
+      stored = latestSession(process.cwd());
+      if (!stored) throw new Error('当前目录没有可继续的会话。先直接提问一次，或用 workbuddy resume <id>。');
+    }
+  } catch (err) {
+    if (args.asJson) console.error(JSON.stringify({ ok: false, error: err.message }, null, 2));
+    else console.error(`Error: ${err.message}`);
+    process.exit(1);
+  }
+
+  const messages = [...(stored?.messages || [])];
+  if (args.systemExplicit) {
+    const rest = messages.filter(message => message.role !== 'system');
+    messages.length = 0;
+    if (args.systemPrompt) messages.push({ role: 'system', content: args.systemPrompt });
+    messages.push(...rest);
+  }
+  messages.push({ role: 'user', content: userPrompt });
+  const model = args.modelExplicit ? args.model : (stored?.model || args.model);
+
   try {
     const result = await callWorkBuddy(userPrompt, {
-      model: args.model,
+      model,
+      messages,
       systemPrompt: args.systemPrompt
+    });
+    const saved = saveSession({
+      id: stored?.id || args.sessionId || createSessionId(),
+      cwd: stored?.cwd || process.cwd(),
+      model,
+      title: stored?.title || userPrompt.slice(0, 48),
+      mode: stored?.mode || 'default',
+      createdAt: stored?.createdAt || Date.now(),
+      updatedAt: Date.now(),
+      messages: [
+        ...messages,
+        { role: 'assistant', content: result.text || '' }
+      ]
     });
 
     if (args.asJson) {
-      console.log(JSON.stringify({ ok: true, data: result }, null, 2));
+      console.log(JSON.stringify({ ok: true, data: { ...result, sessionId: saved.id } }, null, 2));
     } else {
       if (result.reasoning && process.env.WORKBUDDY_SHOW_REASONING === '1') {
         console.error(`[思考过程]\n${result.reasoning}\n`);
       }
       console.log(result.text);
+      if (process.stderr.isTTY) {
+        console.error(`会话 ${saved.id} 已保存。继续：workbuddy -c`);
+      }
     }
   } catch (err) {
     if (args.asJson) {

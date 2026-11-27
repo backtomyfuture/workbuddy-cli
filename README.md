@@ -87,12 +87,19 @@ wb "Write a generic LRU cache in Python"
 | `workbuddy logout` | Revoke server session and remove local CLI credentials |
 | `workbuddy status` / `whoami` | Show CLI auth state, token expiry, and desktop WBIPC status |
 | `workbuddy models` / `-l` | Fetch live available models from server (`--all`, `--json`, `--static`) |
+| `workbuddy sessions` | List conversations saved by this CLI |
+| `workbuddy continue` / `-c` | Continue the latest conversation in the current directory |
+| `workbuddy resume [id]` / `-r` | Resume a conversation by id, or list them when the id is omitted |
+| `workbuddy acp` | ACP stdio server for T3 Code |
 | `workbuddy [options] <prompt>` | Send a prompt to the selected model |
 
 ### Options
 
 | Flag | Description |
 | :--- | :--- |
+| `-c, --continue` | Continue the latest conversation in this directory |
+| `-r, --resume [id]` | Resume one conversation; without an id, list saved conversations |
+| `--session-id <id>` | Use this id when starting a new conversation |
 | `-m, --model <id>` | Model ID or shorthand alias (default: `deepseek-v3-2-volc`) |
 | `-s, --system <prompt>` | Set a system prompt |
 | `-p, --print` | Print response and exit (default behavior) |
@@ -122,11 +129,50 @@ wb -s "You are a senior Go engineer" --json "How do I prevent goroutine leaks?"
 
 # Include reasoning trace in stderr
 WORKBUDDY_SHOW_REASONING=1 wb -m deep "Solve this logic puzzle..."
+
+# Continue the latest chat in this directory, or pick one by id
+wb -c "Turn that into an iterative version"
+wb sessions
+wb resume wb_abc123 "Add tests"
 ```
 
 > **Shorthand Aliases**: Common aliases such as `auto`, `fast`, `balanced`, `deep`, `hy4`, `ds` (`deepseek`), `deepseek-v4`, `glm`, `kimi`, `kimi-pro`, `minimax-flash`, `mimo`, and `step` are mapped automatically. Run `workbuddy models` to see the full live catalog for your account.
 
 ---
+
+## Continue a conversation
+
+Each successful prompt is stored under `~/.workbuddy-cli/sessions/`. The next prompt in the same directory with `-c` / `continue` sends the previous messages back to `/v2/chat/completions`. `resume <id>` opens a specific transcript; a unique id prefix is enough. `--json` includes `sessionId`.
+
+This history belongs to `workbuddy-cli`. It is separate from the desktop app's CodeBuddy sessions (`codebuddy -c` / `codebuddy -r`).
+
+## Use it from T3 Code
+
+T3 Code starts a local ACP agent as a subprocess and speaks newline-delimited JSON-RPC on stdin/stdout.
+
+1. Install this CLI so `workbuddy` is on the PATH used by the T3 Code server (`npm install -g`, or the symlink from `install.sh`).
+2. Run `workbuddy login` once as that same user.
+3. In T3 Code open **Settings → Providers → Add provider → Show more → Local ACP command**.
+4. Command: `workbuddy`. Argument: `acp`. Name it `WorkBuddy`.
+
+The server negotiates ACP v1 and implements:
+
+| Method | Behavior |
+| :--- | :--- |
+| `initialize` | Announces ACP v1, `loadSession`, and text prompts. If the CLI is logged out, advertises a terminal login that runs `workbuddy login`. |
+| `authenticate` / `auth/logout` | Terminal login is not an RPC. Logout revokes the CLI credential. |
+| `session/new` | Creates a conversation bound to the workspace `cwd`. |
+| `session/load`, `session/resume` | Reloads a saved transcript and replays it. |
+| `session/list` | Lists saved conversations. |
+| `session/prompt` | Streams `agent_message_chunk` / `agent_thought_chunk`, then returns `stopReason`. |
+| `session/cancel` | Aborts the in-flight turn. |
+| `session/close` | Drops the in-memory session. The transcript stays on disk. |
+| `session/set_model`, `session/set_config_option` | Changes the model for later turns. |
+| `session/set_mode` | `plan` disables edits and shell commands. |
+
+During a turn the agent can call `read_file`, `list_dir`, `write_file`, and `bash`. Writes, shell commands, and reads ask `session/request_permission`, then use the client's `fs/*` or `terminal` capability when T3 advertises it.
+
+The desktop CodeBuddy binary already speaks ACP too (`codebuddy --acp`). On this machine the unpacked entrypoint only loads if `CODEBUDDY_FORCE_LITE_WB_BUNDLE=1`. `workbuddy acp` is the integration that uses this CLI's own login and transcript store.
 
 ## Architecture
 

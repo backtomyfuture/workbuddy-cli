@@ -1,7 +1,7 @@
 {
   "name": "workbuddy-cli",
-  "version": "1.1.0",
-  "description": "Zero-dependency CLI for Tencent WorkBuddy with standalone browser login/logout, live model scanning, and WBIPC fallback.",
+  "version": "1.2.0",
+  "description": "Zero-dependency CLI for Tencent WorkBuddy with standalone login, resumable chats, and an ACP server for T3 Code.",
   "type": "module",
   "main": "bin/workbuddy.mjs",
   "bin": {

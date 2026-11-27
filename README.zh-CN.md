@@ -87,12 +87,19 @@ wb "用 Python 写一个支持泛型的 LRU 缓存"
 | `workbuddy logout` | 注销服务端会话并删除本地 CLI 凭据 |
 | `workbuddy status` / `whoami` | 查看当前 CLI 登录状态、Token 过期时间及桌面端 WBIPC 状态 |
 | `workbuddy models` / `-l` | 从服务端实时扫描可用模型（支持 `--all`、`--json`、`--static`） |
+| `workbuddy sessions` | 列出本 CLI 保存的对话 |
+| `workbuddy continue` / `-c` | 继续当前目录里最近的一条对话 |
+| `workbuddy resume [id]` / `-r` | 按 id 继续某一条；省略 id 时列出对话 |
+| `workbuddy acp` | 给 T3 Code 用的 ACP stdio 服务 |
 | `workbuddy [选项] <提问内容>` | 向指定模型发起对话 |
 
 ### 常用选项
 
 | 参数 | 说明 |
 | :--- | :--- |
+| `-c, --continue` | 继续当前目录最近的一条对话 |
+| `-r, --resume [id]` | 按 id 继续；不写 id 时列出已保存对话 |
+| `--session-id <id>` | 新建对话时指定 id |
 | `-m, --model <id>` | 指定模型 ID 或简写别名（默认：`deepseek-v3-2-volc`） |
 | `-s, --system <prompt>` | 设定 System Prompt |
 | `-p, --print` | 打印结果后退出（默认行为） |
@@ -122,11 +129,50 @@ wb -s "你是一名资深 Go 开发专家" --json "如何避免 goroutine 泄漏
 
 # 在 stderr 中附带模型思考过程
 WORKBUDDY_SHOW_REASONING=1 wb -m deep "推理一下这道逻辑题..."
+
+# 继续当前目录最近一次对话，或按 id 接着问
+wb -c "把刚才的例子改成迭代版本"
+wb sessions
+wb resume wb_abc123 "补上测试"
 ```
 
 > **常用简写别名**：内置支持 `auto`、`fast`、`balanced`、`deep`、`hy4`、`ds`（`deepseek`）、`deepseek-v4`、`glm`、`kimi`、`kimi-pro`、`minimax-flash`、`mimo`、`step` 等常见简写。完整实时模型列表请直接运行 `workbuddy models` 查看。
 
 ---
+
+## 继续对话
+
+每次成功的提问都会写到 `~/.workbuddy-cli/sessions/`。同一目录里再用 `-c` / `continue`，会把之前的消息一并送给 `/v2/chat/completions`。`resume <id>` 打开指定记录，id 写唯一前缀即可。`--json` 的结果里带 `sessionId`。
+
+这些记录只属于 `workbuddy-cli`，和桌面端 CodeBuddy 自己的会话（`codebuddy -c` / `codebuddy -r`）不是同一份。
+
+## 接到 T3 Code
+
+T3 Code 会把本地 ACP 代理拉成子进程，用换行分隔的 JSON-RPC 走 stdin/stdout。
+
+1. 让 T3 Code 服务所用的那个用户能在 PATH 里找到 `workbuddy`。
+2. 用同一用户执行一次 `workbuddy login`。
+3. 打开 **Settings → Providers → Add provider → Show more → Local ACP command**。
+4. 命令填 `workbuddy`，参数填一行 `acp`，名称填 `WorkBuddy`。
+
+服务端按 ACP v1 应答，常用方法如下：
+
+| 方法 | 行为 |
+| :--- | :--- |
+| `initialize` | 声明 ACP v1、`loadSession` 和文本提示。未登录时广告终端登录，实际运行 `workbuddy login`。 |
+| `authenticate` / `auth/logout` | 终端登录不走 RPC。logout 会注销 CLI 凭据。 |
+| `session/new` | 按工作区 `cwd` 新建对话。 |
+| `session/load`、`session/resume` | 读回记录并重放历史。 |
+| `session/list` | 列出已保存对话。 |
+| `session/prompt` | 流式发送 `agent_message_chunk` / `agent_thought_chunk`，结束后返回 `stopReason`。 |
+| `session/cancel` | 中断当前这一轮。 |
+| `session/close` | 只卸掉内存中的会话，磁盘记录还在。 |
+| `session/set_model`、`session/set_config_option` | 切换后续轮次的模型。 |
+| `session/set_mode` | `plan` 时不改文件、不跑命令。 |
+
+一轮对话里模型可以调用 `read_file`、`list_dir`、`write_file` 和 `bash`。写文件、跑命令和读文件会先发 `session/request_permission`；T3 声明了 `fs/*` 时，读写走客户端，不直接碰磁盘。
+
+桌面端自带的 CodeBuddy 也能说 ACP（`codebuddy --acp`）。这台机器上未解包的完整包需要 `CODEBUDDY_FORCE_LITE_WB_BUNDLE=1` 才能从现有入口启动。`workbuddy acp` 用的是本 CLI 自己的登录态和会话记录。
 
 ## 工作原理
 
