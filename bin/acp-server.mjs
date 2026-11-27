@@ -465,6 +465,7 @@ export async function runAcpServer(deps) {
         model: session.model || defaultModel,
         effort: session.effort,
         tools: session.mode === 'plan' ? TOOLS.filter(tool => tool.function.name === 'read_file' || tool.function.name === 'list_dir') : TOOLS,
+        sessionId: session.id,
         signal,
         timeoutMs: 180000,
         onDelta: delta => {
@@ -490,13 +491,15 @@ export async function runAcpServer(deps) {
             content: { type: 'text', text }
           });
         }
-        session.messages.push({ role: 'assistant', content: text });
+        const done = { role: 'assistant', content: text };
+        if (result.reasoning) done.reasoning = result.reasoning;
+        session.messages.push(done);
         session.updatedAt = Date.now();
         saveSession(session);
         return;
       }
 
-      session.messages.push({
+      const called = {
         role: 'assistant',
         content: result.text || '',
         tool_calls: toolCalls.map(call => ({
@@ -504,7 +507,9 @@ export async function runAcpServer(deps) {
           type: 'function',
           function: { name: call.name, arguments: call.arguments }
         }))
-      });
+      };
+      if (result.reasoning) called.reasoning = result.reasoning;
+      session.messages.push(called);
       for (const call of toolCalls) {
         let toolText = '';
         try {

@@ -83,7 +83,7 @@ wb "Write a generic LRU cache in Python"
 
 | Command | Description |
 | :--- | :--- |
-| `workbuddy login` | Authenticate via browser (`--no-browser` prints URL for SSH/headless) |
+| `workbuddy login` | Authenticate via browser (`--no-browser` prints URL for SSH/headless). `--api-key` uses a key from the [keys page](https://www.workbuddy.cn/profile/keys), read from `WORKBUDDY_API_KEY` or a hidden terminal prompt |
 | `workbuddy logout` | Revoke server session and remove local CLI credentials |
 | `workbuddy status` / `whoami` | Show CLI auth state, token expiry, and desktop WBIPC status |
 | `workbuddy models` / `-l` | Fetch live available models from server (`--all`, `--json`, `--static`) |
@@ -190,7 +190,7 @@ Mode B (Fallback): Local Desktop WBIPC
 └─────────────────┘   HMAC-SHA256 Handshake + JSON-RPC   └────────────────────────┘
 ```
 
-1. **Standalone Mode**: `workbuddy login` completes browser OAuth polling and stores credentials in `~/.workbuddy-cli/auth.json` (`0600` permissions, isolated from the desktop app). Requests hit `/v2/chat/completions` and `/v2/enterprises/.../models` directly and auto-refresh expired tokens.
+1. **Standalone Mode**: `workbuddy login` completes browser OAuth polling and stores credentials in `~/.workbuddy-cli/auth.json` (`0600` permissions, isolated from the desktop app). Model lists prefer `GET /v3/config` (the CLI agent's catalog) and fall back to `/v2/enterprises/.../models`. Chats go to `/v2/chat/completions`. Each request is streamed, opens with a system message, keeps one conversation id for the saved session, and one turn id across the tool steps of a single user send. A known unapproved-channel line is reworded before send; a refusal is retried once with the system text moved into the user message. An expiring token is refreshed once, and a sign-in older than a day is refreshed on the next use. Concurrent callers share that refresh. A `401` that names another product error does not spend the refresh token. An enterprise domain returned at login becomes the API origin and is sent as `X-Domain` with the enterprise id. Authenticated requests use the official CLI User-Agent `WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0`; set `WORKBUDDY_USER_AGENT` to replace it. Terminal chats stream. Large bodies are gzipped.
 2. **WBIPC Fallback**: If no CLI session exists, `workbuddy-cli` discovers `~/.workbuddy/wbipc/endpoint.json`, completes an HMAC-SHA256 challenge-response handshake, and proxies requests through the running desktop app's `wb.request` pipe.
 
 ---

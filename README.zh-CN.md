@@ -83,7 +83,7 @@ wb "用 Python 写一个支持泛型的 LRU 缓存"
 
 | 命令 | 说明 |
 | :--- | :--- |
-| `workbuddy login` | 通过浏览器登录（SSH/无界面环境可加 `--no-browser` 打印链接） |
+| `workbuddy login` | 通过浏览器登录（SSH/无界面环境可加 `--no-browser` 打印链接）。`--api-key` 改用 [密钥页](https://www.workbuddy.cn/profile/keys) 的密钥，从环境变量 `WORKBUDDY_API_KEY` 读取，或在终端里不回显输入 |
 | `workbuddy logout` | 注销服务端会话并删除本地 CLI 凭据 |
 | `workbuddy status` / `whoami` | 查看当前 CLI 登录状态、Token 过期时间及桌面端 WBIPC 状态 |
 | `workbuddy models` / `-l` | 从服务端实时扫描可用模型（支持 `--all`、`--json`、`--static`） |
@@ -190,7 +190,7 @@ T3 Code 会把本地 ACP 代理拉成子进程，用换行分隔的 JSON-RPC 走
 └─────────────────┘   HMAC-SHA256 Handshake + JSON-RPC   └────────────────────────┘
 ```
 
-1. **独立直连模式**：`workbuddy login` 通过外部链接授权轮询获取 Token 与账号信息，以 `0600` 权限保存在 `~/.workbuddy-cli/auth.json`（与桌面端配置完全隔离）。后续请求直接调用 `/v2/chat/completions` 与 `/v2/enterprises/.../models`，并在 Token 临期或返回 `401` 时自动刷新。
+1. **独立直连模式**：`workbuddy login` 通过外部链接授权轮询获取 Token 与账号信息，以 `0600` 权限保存在 `~/.workbuddy-cli/auth.json`（与桌面端配置完全隔离）。模型列表优先读 `GET /v3/config`（CLI 代理声明的目录），失败再回退 `/v2/enterprises/.../models`。对话走 `/v2/chat/completions`：只发流式、补上 system 开头、同一条已保存会话共用一个会话 id，同一次提问的工具往返共用一个轮次 id。已知的「未批准渠道」开场白会先改写；若仍被拒绝，再把 system 挪进用户消息重试一次。Token 临期，或登录态已超过一天，会在下次请求前刷新；同一时刻的并发请求共用这一次刷新。带有其他业务错误码的 `401` 不会拿去换票。登录返回的企业域名会作为接口地址，并带上 `X-Domain` 与企业 ID。已登录请求的 `User-Agent` 使用官方 CLI 的 `WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0`，可用环境变量 `WORKBUDDY_USER_AGENT` 整体替换。较长的请求体会 gzip。终端对话按流式输出。
 2. **WBIPC 桌面端回退**：若未执行 `workbuddy login`，CLI 会自动检测 `~/.workbuddy/wbipc/endpoint.json`，通过 HMAC-SHA256 握手经桌面端 `wb.request` 管线代理请求。
 
 ---

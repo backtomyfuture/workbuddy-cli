@@ -14,7 +14,9 @@
 
 合法等级是 `minimal`、`low`、`medium`、`high`、`xhigh`、`max`（`VALID_REASONING_EFFORTS`）。命令行 `--effort` 还多一个 `ultracode`，那是桌面端工作流，不要放进 CLI。
 
-关掉思考时用 `none`，不要用空字段。`onlyReasoning: true` 的模型不能关（`canDisableThinking`：`onlyReasoning` 为真就返回 false）。
+关掉思考时用 `none`，不要用空字段。`onlyReasoning: true` 的模型不能关（`canDisableThinking`：`onlyReasoning` 为真就返回 false）。例外：`deepseek-v4.1-flash` 和 `deepseek-v4.1-flash-sg` 在目录里标了 onlyReasoning，但 `reasoning_effort: "none"` 仍然有效，CLI 对这两个模型提供关闭。
+
+多轮回放时，助手消息上的思考过程写成字符串字段 `reasoning`。网关会丢掉 `reasoning_content`，部分模型读得到 `reasoning`。
 
 还没抓到一条真实的 `www.workbuddy.cn/v2/chat/completions` 报文。网关对「打开」更认 `reasoning_effort` 还是 `reasoning.effort`，源码里两条都出现过。最小实现两个都写同一个等级；关闭时只写 `reasoning_effort: "none"`，并去掉 `reasoning`。
 

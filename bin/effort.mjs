@@ -77,6 +77,9 @@ function profileOf(modelId) {
   return undefined;
 }
 
+// These two answer reasoning_effort "none" even when the catalog says onlyReasoning.
+const OFF_TAKEN = new Set(['deepseek-v4.1-flash', 'deepseek-v4.1-flash-sg']);
+
 export function effortChoices(modelId) {
   const profile = profileOf(modelId);
   if (profile === null) return [];
@@ -84,7 +87,7 @@ export function effortChoices(modelId) {
   const choices = levels
     .filter(level => EFFORT_LEVELS.includes(level))
     .map(value => ({ value, name: LABELS[value] || value }));
-  if (profile?.onlyReasoning) return choices;
+  if (profile?.onlyReasoning && !OFF_TAKEN.has(modelId)) return choices;
   return [...choices, { value: 'off', name: LABELS.off }];
 }
 

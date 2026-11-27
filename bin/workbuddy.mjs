@@ -9,6 +9,18 @@ import { fileURLToPath } from 'node:url';
 import { runAcpServer } from './acp-server.mjs';
 import { accountDefaultModel, acpModelsFromCatalog } from './catalog.mjs';
 import { applyReasoning, installModelProfiles, parseEffort, resolveEffort } from './effort.mjs';
+import { accessShouldRenew, apiAuthHeaders, apiOrigin, clientUserAgent, enterpriseHost, isApiKeySession, shouldRefreshAccessToken } from './session-auth.mjs';
+import {
+  conversationHeaders,
+  encodeChatBody,
+  explainChatError,
+  gzipRejected,
+  isChannelRefusal,
+  modelsFromProductConfig,
+  prepareChat,
+  refusalFallbacks,
+  restoreToolNames
+} from './wire.mjs';
 import {
   authFilePath,
   cliHome,
@@ -30,6 +42,7 @@ const LOGIN_POLL_INTERVAL_MS = 1500;
 const LOGIN_TIMEOUT_MS = 300000;
 const LOGIN_TOKEN_PENDING_CODE = 11217;
 const LOGIN_ACCOUNT_PENDING_CODE = 12151;
+const CHAT_TIMEOUT_MS = 180000;
 
 const MODEL_ALIASES = {
   // 模式
@@ -217,6 +230,7 @@ Interact with WorkBuddy directly (after login) or via local desktop WBIPC.
 
 Commands:
   login                   Log in via browser (no desktop app needed afterwards)
+  login --api-key         Save a key from https://www.workbuddy.cn/profile/keys
   logout                  Revoke session and remove local CLI credentials
   status, whoami          Show current CLI auth and desktop WBIPC status
   models                  Scan available models from server (falls back to static list)
@@ -241,10 +255,12 @@ Options:
   --json                  Output response as JSON
   -s, --system <prompt>   System prompt
   --no-browser            Print login URL instead of opening browser automatically
+  --api-key               Log in with a key from the WorkBuddy keys page (prompted, or WORKBUDDY_API_KEY)
   -h, --help              Show this help message
 
 Examples:
   workbuddy login
+  workbuddy login --api-key
   workbuddy models
   workbuddy "用Python写一个快速排序"
   workbuddy -c "把刚才的例子改成迭代版本"
@@ -267,6 +283,7 @@ function parseArgs(args) {
   let systemPrompt = '';
   let systemExplicit = false;
   let noBrowser = false;
+  let apiKey = false;
   let includeAllModels = false;
   let staticModels = false;
   let continueSession = false;
@@ -318,6 +335,8 @@ function parseArgs(args) {
       asJson = true;
     } else if (arg === '--no-browser') {
       noBrowser = true;
+    } else if (arg === '--api-key') {
+      apiKey = true;
     } else if (arg === '--all') {
       includeAllModels = true;
     } else if (arg === '--static') {
@@ -382,6 +401,7 @@ function parseArgs(args) {
     systemPrompt,
     systemExplicit,
     noBrowser,
+    apiKey,
     includeAllModels,
     staticModels,
     continueSession,
@@ -464,6 +484,7 @@ function buildDomainHeader(endpoint, auth) {
 
 function buildEnterpriseHeaders(endpoint, auth, account) {
   const headers = {
+    'User-Agent': clientUserAgent(),
     'X-Domain': buildDomainHeader(endpoint, auth)
   };
   const enterpriseId = account?.enterpriseId;
@@ -513,10 +534,76 @@ async function fetchJson(url, options = {}) {
     try {
       json = JSON.parse(text);
     } catch {}
-    return { status: res.status, ok: res.ok, json, text };
+    return {
+      status: res.status,
+      ok: res.ok,
+      json,
+      text,
+      wwwAuthenticate: res.headers.get('www-authenticate') || ''
+    };
   } finally {
     clearTimeout(timer);
   }
+}
+
+function readSecret(prompt) {
+  return new Promise((resolve, reject) => {
+    if (!process.stdin.isTTY) {
+      reject(new Error('请设置环境变量 WORKBUDDY_API_KEY，或在终端中运行 workbuddy login --api-key'));
+      return;
+    }
+    const stdin = process.stdin;
+    let value = '';
+    process.stderr.write(prompt);
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.setEncoding('utf8');
+    const onData = chunk => {
+      if (chunk === '\u0003') {
+        stdin.setRawMode(false);
+        stdin.pause();
+        process.stderr.write('\n');
+        process.exit(130);
+      }
+      if (chunk === '\r' || chunk === '\n' || chunk === '\u0004') {
+        stdin.setRawMode(false);
+        stdin.pause();
+        stdin.off('data', onData);
+        process.stderr.write('\n');
+        resolve(value.trim());
+        return;
+      }
+      if (chunk === '\u007f' || chunk === '\b') {
+        value = value.slice(0, -1);
+        return;
+      }
+      if (chunk.charCodeAt(0) < 32) return;
+      value += chunk;
+    };
+    stdin.on('data', onData);
+  });
+}
+
+async function loginWithApiKey() {
+  const fromEnv = process.env.WORKBUDDY_API_KEY?.trim();
+  const key = fromEnv || await readSecret('WorkBuddy API 密钥（输入不回显）: ');
+  if (!key) throw new Error('未提供 API 密钥');
+  const session = {
+    endpoint: DEFAULT_ENDPOINT,
+    auth: {
+      accessToken: key,
+      tokenType: 'ApiKey',
+      source: 'api-key',
+      lastRefreshTime: Date.now()
+    },
+    account: {
+      uid: `anonymous_${key.slice(-8)}`,
+      type: 'api-key'
+    },
+    updatedAt: Date.now()
+  };
+  writeCliSession(session);
+  return session;
 }
 
 async function loginWorkBuddy(options = {}) {
@@ -614,7 +701,7 @@ async function loginWorkBuddy(options = {}) {
   }
 
   const session = {
-    endpoint,
+    endpoint: enterpriseHost(tokenData.domain) ? `https://${enterpriseHost(tokenData.domain)}` : endpoint,
     auth: tokenData,
     account: account ? {
       uid: account.uid,
@@ -629,8 +716,10 @@ async function loginWorkBuddy(options = {}) {
   return session;
 }
 
-async function refreshCliSession(session) {
-  const endpoint = session.endpoint || DEFAULT_ENDPOINT;
+let refreshFlight = null;
+
+async function refreshCliSessionOnce(session) {
+  const endpoint = apiOrigin(session);
   const refreshToken = session.auth?.refreshToken;
   if (!refreshToken) {
     throw new Error('当前凭据缺少 refreshToken，请重新运行 "workbuddy login"');
@@ -652,11 +741,43 @@ async function refreshCliSession(session) {
 
   const updated = {
     ...session,
+    endpoint,
     auth: normalizeToken(res.json.data, session.auth?.domain || buildDomainHeader(endpoint)),
     updatedAt: Date.now()
   };
   writeCliSession(updated);
   return updated;
+}
+
+async function refreshCliSession(session) {
+  if (isApiKeySession(session)) {
+    throw new Error('API 密钥不会自动续期。请到密钥页核对后重新运行 "workbuddy login --api-key"');
+  }
+  if (!refreshFlight) {
+    const flight = (async () => {
+      const latest = readCliSession() || session;
+      const stillCurrent = latest.auth?.accessToken
+        && latest.auth.accessToken !== session.auth?.accessToken
+        && latest.auth.expiresAt
+        && Date.now() < latest.auth.expiresAt - 60000;
+      if (stillCurrent) return latest;
+      return refreshCliSessionOnce(latest.auth?.refreshToken ? latest : session);
+    })().finally(() => {
+      if (refreshFlight === flight) refreshFlight = null;
+    });
+    refreshFlight = flight;
+  }
+  return refreshFlight;
+}
+
+async function withFreshSession(session) {
+  if (!accessShouldRenew(session)) return session;
+  try {
+    return await refreshCliSession(session);
+  } catch (err) {
+    if (session.auth?.expiresAt && Date.now() < session.auth.expiresAt - 60000) return session;
+    throw err;
+  }
 }
 
 async function logoutWorkBuddy() {
@@ -703,9 +824,12 @@ function createSseAccumulator(onDelta, onReasoning) {
       text += message.content;
       onDelta?.(message.content);
     }
-    if (message.reasoning_content) {
-      reasoning += message.reasoning_content;
-      onReasoning?.(message.reasoning_content);
+    const thought = typeof message.reasoning_content === 'string' && message.reasoning_content
+      ? message.reasoning_content
+      : typeof message.reasoning === 'string' ? message.reasoning : '';
+    if (thought) {
+      reasoning += thought;
+      onReasoning?.(thought);
     }
     for (const call of message.tool_calls || []) {
       const idx = call.index ?? toolCalls.size;
@@ -740,9 +864,12 @@ function createSseAccumulator(onDelta, onReasoning) {
         text += delta.content;
         onDelta?.(delta.content);
       }
-      if (delta?.reasoning_content) {
-        reasoning += delta.reasoning_content;
-        onReasoning?.(delta.reasoning_content);
+      const thought = typeof delta?.reasoning_content === 'string' && delta.reasoning_content
+        ? delta.reasoning_content
+        : typeof delta?.reasoning === 'string' ? delta.reasoning : '';
+      if (thought) {
+        reasoning += thought;
+        onReasoning?.(thought);
       }
       for (const call of delta?.tool_calls || []) {
         const idx = call.index ?? 0;
@@ -831,28 +958,11 @@ function mockComplete({ messages, signal, onDelta }) {
 }
 
 async function fetchDirectApi(session, method, apiPath, body) {
-  let activeSession = session;
-  if (
-    activeSession.auth?.refreshToken &&
-    activeSession.auth?.expiresAt &&
-    Date.now() >= activeSession.auth.expiresAt - 60000
-  ) {
-    activeSession = await refreshCliSession(activeSession);
-  }
+  let activeSession = await withFreshSession(session);
 
   const sendOnce = async s => {
-    const endpoint = (s.endpoint || DEFAULT_ENDPOINT).replace(/\/+$/, '');
-    const headers = {
-      'Accept': 'application/json',
-      'Authorization': `Bearer ${s.auth.accessToken}`
-    };
-    if (s.account?.uid) {
-      headers['X-User-Id'] = s.account.uid;
-    }
-    if (s.account?.enterpriseId) {
-      headers['X-Enterprise-Id'] = s.account.enterpriseId;
-      headers['X-Tenant-Id'] = s.account.enterpriseId;
-    }
+    const endpoint = apiOrigin(s);
+    const headers = apiAuthHeaders(s, { accept: 'application/json' });
     const init = { method, headers };
     if (body !== undefined && method !== 'GET' && method !== 'HEAD') {
       headers['Content-Type'] = 'application/json';
@@ -862,7 +972,11 @@ async function fetchDirectApi(session, method, apiPath, body) {
   };
 
   let res = await sendOnce(activeSession);
-  if (res.status === 401 && activeSession.auth?.refreshToken) {
+  if (
+    !isApiKeySession(activeSession)
+    && activeSession.auth?.refreshToken
+    && shouldRefreshAccessToken(res.status, res.wwwAuthenticate, res.text)
+  ) {
     activeSession = await refreshCliSession(activeSession);
     res = await sendOnce(activeSession);
   }
@@ -979,13 +1093,31 @@ async function scanAvailableModels(options = {}) {
     return { source: 'static', models: null, reason: '未登录且桌面端未运行' };
   }
 
+  let lastErr = null;
+  const readConfig = async () => {
+    if (cliSession?.auth?.accessToken) return fetchDirectApi(cliSession, 'GET', '/v3/config');
+    if (hasIpc) return fetchIpcApi('GET', '/v3/config');
+    return null;
+  };
+  try {
+    const config = await readConfig();
+    const configured = modelsFromProductConfig(config, { includeAll: options.includeAll });
+    if (configured.length) {
+      return {
+        source: cliSession?.auth?.accessToken ? 'remote-config' : 'remote-config-ipc',
+        models: configured
+      };
+    }
+  } catch (err) {
+    lastErr = err;
+  }
+
   const enterpriseId = cliSession?.account?.enterpriseId;
   const candidatePaths = enterpriseId
     ? [`/v2/enterprises/${encodeURIComponent(enterpriseId)}/models`, '/v2/enterprises/personal/models']
     : ['/v2/enterprises/personal/models'];
 
   let payload = null;
-  let lastErr = null;
   for (const apiPath of candidatePaths) {
     try {
       payload = cliSession?.auth?.accessToken
@@ -1035,6 +1167,7 @@ function printScannedModels(models, source) {
     if (m.supportsReasoning) caps.push('推理');
     if (m.supportsImages) caps.push('视觉');
     if (m.supportsToolCall) caps.push('工具');
+    if (m.maxInputTokens) caps.push(`上下文 ${m.maxInputTokens}`);
     if (Array.isArray(m.tags) && m.tags.length) caps.push(m.tags.join(','));
     const capText = caps.length ? ` (${caps.join(' / ')})` : '';
     const title = m.name && m.name !== m.id ? ` — ${m.name}` : '';
@@ -1055,6 +1188,9 @@ function chatPayload(userPrompt, options = {}) {
         if (message.tool_calls) next.tool_calls = message.tool_calls;
         if (message.tool_call_id) next.tool_call_id = message.tool_call_id;
         if (message.name) next.name = message.name;
+        if (typeof message.reasoning === 'string' && message.reasoning) next.reasoning = message.reasoning;
+        if (typeof message.reasoning_content === 'string' && message.reasoning_content) next.reasoning_content = message.reasoning_content;
+        if (Array.isArray(message.reasoning_details)) next.reasoning_details = message.reasoning_details;
         return next;
       })
     : [];
@@ -1075,7 +1211,7 @@ function chatPayload(userPrompt, options = {}) {
       }
     }
   }
-  const payload = { model, messages, stream: true };
+  const payload = { model, messages, stream: true }; // the chat endpoint answers a stream
   if (tools?.length) payload.tools = tools;
   applyReasoning(payload, options.effort);
   return payload;
@@ -1103,45 +1239,54 @@ function linkAbortSignals(external, timeoutMs) {
   };
 }
 
+function accountScope(session) {
+  const key = isApiKeySession(session) ? session?.auth?.accessToken || '' : '';
+  return `${session?.account?.uid || ''}|${session?.account?.enterpriseId || ''}|${key}`;
+}
+
+function chatBodies(userPrompt, options) {
+  const prepared = prepareChat(chatPayload(userPrompt, options));
+  return {
+    names: prepared.names,
+    bodies: [prepared.payload, ...refusalFallbacks(prepared.payload)]
+  };
+}
+
 async function callWorkBuddyDirect(session, userPrompt, options = {}) {
-  let activeSession = session;
-  if (
-    activeSession.auth?.refreshToken &&
-    activeSession.auth?.expiresAt &&
-    Date.now() >= activeSession.auth.expiresAt - 60000
-  ) {
-    activeSession = await refreshCliSession(activeSession);
-  }
+  let activeSession = await withFreshSession(session);
+  const { names, bodies } = chatBodies(userPrompt, options);
+  const timeoutMs = options.timeoutMs || CHAT_TIMEOUT_MS;
+  let refreshed = false;
 
-  const payload = chatPayload(userPrompt, options);
-  const timeoutMs = options.timeoutMs || 60000;
-
-  const sendRequest = async s => {
-    const endpoint = (s.endpoint || DEFAULT_ENDPOINT).replace(/\/+$/, '');
+  const sendRequest = async (s, payload, packed) => {
+    const endpoint = apiOrigin(s);
     const headers = {
       'Content-Type': 'application/json',
-      'Accept': 'text/event-stream',
-      'Authorization': `Bearer ${s.auth.accessToken}`
+      ...apiAuthHeaders(s, { accept: 'text/event-stream' }),
+      ...conversationHeaders({
+        sessionId: options.sessionId,
+        messages: payload.messages,
+        scope: accountScope(s)
+      })
     };
-    if (s.account?.uid) {
-      headers['X-User-Id'] = s.account.uid;
-    }
-    if (s.account?.enterpriseId) {
-      headers['X-Enterprise-Id'] = s.account.enterpriseId;
-      headers['X-Tenant-Id'] = s.account.enterpriseId;
-    }
+    if (packed.encoding) headers['Content-Encoding'] = packed.encoding;
 
     const linked = linkAbortSignals(options.signal, timeoutMs);
     try {
       const res = await fetch(`${endpoint}/v2/chat/completions`, {
         method: 'POST',
         headers,
-        body: JSON.stringify(payload),
+        body: packed.body,
         signal: linked.signal
       });
       if (!res.ok) {
         const raw = await res.text();
-        return { status: res.status, raw, completion: null };
+        return {
+          status: res.status,
+          raw,
+          wwwAuthenticate: res.headers.get('www-authenticate') || '',
+          completion: null
+        };
       }
       const completion = await readSseResponse(res, options.onDelta, options.onReasoning);
       return { status: res.status, raw: '', completion };
@@ -1160,24 +1305,34 @@ async function callWorkBuddyDirect(session, userPrompt, options = {}) {
     }
   };
 
-  let res = await sendRequest(activeSession);
-  if (res.status === 401 && activeSession.auth?.refreshToken) {
-    activeSession = await refreshCliSession(activeSession);
-    res = await sendRequest(activeSession);
-  }
-
-  if (res.status >= 400) {
-    let errorText = `HTTP ${res.status}`;
-    try {
-      const errJson = JSON.parse(res.raw);
-      errorText += `: ${errJson.msg || errJson.message || res.raw}`;
-    } catch {
-      if (res.raw) errorText += `: ${res.raw}`;
+  let res = null;
+  for (let i = 0; i < bodies.length; i += 1) {
+    const payload = bodies[i];
+    let packed = encodeChatBody(payload);
+    res = await sendRequest(activeSession, payload, packed);
+    if (
+      !refreshed
+      && !isApiKeySession(activeSession)
+      && activeSession.auth?.refreshToken
+      && shouldRefreshAccessToken(res.status, res.wwwAuthenticate, res.raw)
+    ) {
+      activeSession = await refreshCliSession(activeSession);
+      refreshed = true;
+      res = await sendRequest(activeSession, payload, packed);
     }
-    throw new Error(errorText);
+    if (gzipRejected(res.status, res.raw)) {
+      packed = { body: JSON.stringify(payload), encoding: null };
+      res = await sendRequest(activeSession, payload, packed);
+    }
+    if (res.status < 400) break;
+    if (!isChannelRefusal(res.raw) || i === bodies.length - 1) break;
   }
 
-  return res.completion;
+  if (!res || res.status >= 400) {
+    throw new Error(explainChatError(res?.status || 0, res?.raw || ''));
+  }
+
+  return restoreToolNames(res.completion, names);
 }
 
 async function callWorkBuddy(userPrompt, options = {}) {
@@ -1206,10 +1361,10 @@ async function callWorkBuddy(userPrompt, options = {}) {
     throw new Error(`读取 WBIPC endpoint.json 失败: ${err.message}`);
   }
 
-  const payload = chatPayload(userPrompt, options);
-  const timeoutMs = options.timeoutMs || 60000;
+  const { names, bodies } = chatBodies(userPrompt, options);
+  const timeoutMs = options.timeoutMs || CHAT_TIMEOUT_MS;
 
-  return new Promise((resolve, reject) => {
+  const postOne = payload => new Promise((resolve, reject) => {
     const socket = net.connect({ path: discovery.endpoint });
     let buffer = Buffer.alloc(0);
     const clientNonce = crypto.randomBytes(16).toString('base64url');
@@ -1309,15 +1464,15 @@ async function callWorkBuddy(userPrompt, options = {}) {
           }
 
           if (f.result?.status && f.result.status >= 400) {
-            let errorText = `HTTP ${f.result.status}`;
+            let bodyStr = '';
             if (f.result.body_b64) {
               try {
-                const bodyStr = Buffer.from(f.result.body_b64, 'base64').toString('utf8');
-                const errJson = JSON.parse(bodyStr);
-                errorText += `: ${errJson.msg || errJson.message || bodyStr}`;
+                bodyStr = Buffer.from(f.result.body_b64, 'base64').toString('utf8');
               } catch {}
             }
-            return finish(reject, new Error(errorText));
+            const error = new Error(explainChatError(f.result.status, bodyStr));
+            error.raw = bodyStr;
+            return finish(reject, error);
           }
 
           if (!f.result || !f.result.body_b64) {
@@ -1337,6 +1492,18 @@ async function callWorkBuddy(userPrompt, options = {}) {
       finish(reject, new Error(`连接 WorkBuddy 套接字失败: ${err.message}`));
     });
   });
+
+  let lastError = null;
+  for (let i = 0; i < bodies.length; i += 1) {
+    try {
+      const completion = await postOne(bodies[i]);
+      return restoreToolNames(completion, names);
+    } catch (err) {
+      lastError = err;
+      if (err?.name === 'AbortError' || !isChannelRefusal(err.raw || err.message) || i === bodies.length - 1) throw err;
+    }
+  }
+  throw lastError;
 }
 
 function getStatusInfo() {
@@ -1349,6 +1516,9 @@ function getStatusInfo() {
     endpoint: cliSession?.endpoint || DEFAULT_ENDPOINT,
     account: cliSession?.account || null,
     expiresAt: cliSession?.auth?.expiresAt ? new Date(cliSession.auth.expiresAt).toISOString() : null,
+    authSource: cliSession ? (isApiKeySession(cliSession) ? 'api-key' : 'browser') : null,
+    domain: cliSession?.auth?.domain || null,
+    apiOrigin: cliSession ? apiOrigin(cliSession) : null,
     desktopWbicpRunning: desktopRunning
   };
 }
@@ -1358,12 +1528,24 @@ async function main() {
 
   if (args.command === 'login') {
     try {
-      const session = await loginWorkBuddy({ noBrowser: args.noBrowser });
+      const session = args.apiKey
+        ? await loginWithApiKey()
+        : await loginWorkBuddy({ noBrowser: args.noBrowser });
       if (args.asJson) {
-        console.log(JSON.stringify({ ok: true, account: session.account, authFile: AUTH_FILE }, null, 2));
+        console.log(JSON.stringify({
+          ok: true,
+          account: session.account,
+          authSource: isApiKeySession(session) ? 'api-key' : 'browser',
+          apiOrigin: apiOrigin(session),
+          authFile: AUTH_FILE
+        }, null, 2));
+      } else if (isApiKeySession(session)) {
+        console.log('登录成功。已保存 API 密钥，请求会计入该密钥对应的套餐。');
+        console.log(`凭据已保存至: ${AUTH_FILE}`);
       } else {
         const who = session.account?.nickname || session.account?.uid || 'Unknown';
         console.log(`登录成功！当前账号: ${who}`);
+        if (enterpriseHost(session.auth?.domain)) console.log(`企业域名: ${apiOrigin(session)}`);
         console.log(`凭据已保存至: ${AUTH_FILE}（后续无需再开启 WorkBuddy 客户端）`);
       }
     } catch (err) {
@@ -1398,6 +1580,9 @@ async function main() {
       if (info.cliLoggedIn) {
         const who = info.account?.nickname || info.account?.uid || '(未知用户)';
         console.log(`当前账号: ${who}`);
+        console.log(`登录方式: ${info.authSource === 'api-key' ? 'API 密钥' : '浏览器授权'}`);
+        if (info.domain) console.log(`账号域名: ${info.domain}`);
+        if (info.apiOrigin) console.log(`接口地址: ${info.apiOrigin}`);
         if (info.expiresAt) console.log(`Token 过期时间: ${info.expiresAt}`);
         console.log(`凭据文件: ${info.authFile}`);
       }
@@ -1447,7 +1632,7 @@ async function main() {
 
   if (args.command === 'acp') {
     const pkgPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
-    let version = '1.3.0';
+    let version = '1.4.0';
     try {
       version = JSON.parse(fs.readFileSync(pkgPath, 'utf8')).version || version;
     } catch {}
@@ -1515,6 +1700,17 @@ async function main() {
     process.exit(1);
   }
 
+  let catalog = null;
+  if (process.env.WORKBUDDY_ACP_MOCK !== '1' && readCliSession()?.auth?.accessToken) {
+    try {
+      catalog = await scanAvailableModels();
+      if (catalog.models?.length) installModelProfiles(catalog.models);
+    } catch (err) {
+      if (!args.asJson) console.error(`模型列表暂不可用，思考等级使用内置配置: ${err.message}`);
+    }
+  }
+
+  const sessionId = stored?.id || args.sessionId || createSessionId();
   const messages = [...(stored?.messages || [])];
   if (args.systemExplicit) {
     const rest = messages.filter(message => message.role !== 'system');
@@ -1523,7 +1719,9 @@ async function main() {
     messages.push(...rest);
   }
   messages.push({ role: 'user', content: userPrompt });
-  const model = args.modelExplicit ? args.model : (stored?.model || args.model);
+  const model = args.modelExplicit
+    ? args.model
+    : (stored?.model || accountDefaultModel(catalog?.models) || args.model);
   let effort;
   if (args.effortExplicit) {
     effort = parseEffort(args.effort);
@@ -1544,14 +1742,31 @@ async function main() {
   }
 
   try {
+    let streamed = false;
+    let reasoningStarted = false;
+    const showReasoning = !args.asJson && process.env.WORKBUDDY_SHOW_REASONING === '1';
     const result = await callWorkBuddy(userPrompt, {
       model,
       messages,
       systemPrompt: args.systemPrompt,
-      effort: resolvedEffort.effort
+      effort: resolvedEffort.effort,
+      sessionId,
+      onDelta: args.asJson ? undefined : chunk => {
+        streamed = true;
+        process.stdout.write(chunk);
+      },
+      onReasoning: showReasoning ? chunk => {
+        if (!reasoningStarted) {
+          process.stderr.write('[思考过程]\n');
+          reasoningStarted = true;
+        }
+        process.stderr.write(chunk);
+      } : undefined
     });
+    const assistant = { role: 'assistant', content: result.text || '' };
+    if (result.reasoning) assistant.reasoning = result.reasoning;
     const saved = saveSession({
-      id: stored?.id || args.sessionId || createSessionId(),
+      id: sessionId,
       cwd: stored?.cwd || process.cwd(),
       model,
       effort: resolvedEffort.effort,
@@ -1561,17 +1776,16 @@ async function main() {
       updatedAt: Date.now(),
       messages: [
         ...messages,
-        { role: 'assistant', content: result.text || '' }
+        assistant
       ]
     });
 
     if (args.asJson) {
       console.log(JSON.stringify({ ok: true, data: { ...result, sessionId: saved.id, effort: saved.effort } }, null, 2));
     } else {
-      if (result.reasoning && process.env.WORKBUDDY_SHOW_REASONING === '1') {
-        console.error(`[思考过程]\n${result.reasoning}\n`);
-      }
-      console.log(result.text);
+      if (reasoningStarted) process.stderr.write('\n\n');
+      if (streamed) process.stdout.write('\n');
+      else console.log(result.text);
       if (process.stderr.isTTY) {
         console.error(`会话 ${saved.id} 已保存。继续：workbuddy -c`);
       }
