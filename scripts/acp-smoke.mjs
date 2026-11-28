@@ -244,6 +244,8 @@ function testWorkspace() {
   assert(roots.includes(fs.realpathSync(os.homedir())), 'home root missing');
   const brief = workspaceBrief(roots);
   assert(brief.includes(`路径：${roots[0]}`), 'brief missing cwd');
+  assert(brief.includes('不要主动说出工作空间路径'), 'brief should keep the path quiet');
+  assert(!brief.includes('打招呼'), 'brief should not recite the path on greeting');
   assert(workspaceInfo(roots).isGitWorkspace === true, 'repo should be git');
   assert(requestedWorkspace({ workingDirectory: roots[0] }) === roots[0], 'workingDirectory');
   assert(brief.includes('package.json') || brief.includes('bin'), brief);

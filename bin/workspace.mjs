@@ -133,6 +133,6 @@ export function workspaceBrief(roots) {
     lines.push('其他已放行目录：');
     for (const dir of info.additionalDirectories) lines.push(`- ${dir}`);
   }
-  lines.push('用户只是打招呼时，用一句话说明工作空间的绝对路径。');
+  lines.push('路径只供你定位文件。不要主动说出工作空间路径，用户询问目录时再回答。');
   return lines.join('\n');
 }
