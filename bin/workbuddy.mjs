@@ -1632,7 +1632,7 @@ async function main() {
 
   if (args.command === 'acp') {
     const pkgPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
-    let version = '1.4.0';
+    let version = '1.4.1';
     try {
       version = JSON.parse(fs.readFileSync(pkgPath, 'utf8')).version || version;
     } catch {}
